@@ -240,6 +240,12 @@ def run_startup_mail_gate(parent: tk.Misc, db: dict, save: SaveFn) -> bool:
     except Exception:
         pass
     try:
+        cb = getattr(parent, "_cdc_apply_macos_dock_icon", None)
+        if callable(cb):
+            win.after(80, cb)
+    except Exception:
+        pass
+    try:
         win.grab_set()
     except Exception:
         pass

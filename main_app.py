@@ -1534,6 +1534,35 @@ def _ttk_combobox_sync_open_popdown_selection(cb: ttk.Combobox, index: int) -> N
         pass
 
 
+def apply_ttk_combobox_display_font(cb: ttk.Combobox, font: tuple | str) -> None:
+    """Font del campo e del menu a tendina.
+
+    Su macOS e Windows il tema ttk (Sun Valley) spesso ignora ``TCombobox.font`` sul
+    campo e sulla Listbox del popdown: senza questo i menu Categorie/Conti restano
+    più piccoli delle etichette e dei campi vicini.
+    """
+    try:
+        cb.configure(font=font)
+    except tk.TclError:
+        return
+
+    def _apply_popdown(_e: tk.Event | None = None) -> None:
+        try:
+            pop_path = str(cb.tk.call("ttk::combobox::PopdownWindow", cb))
+            lb_path = f"{pop_path}.f.l"
+            cb.tk.call(lb_path, "configure", "-font", font)
+        except tk.TclError:
+            pass
+
+    cb.bind("<<ComboboxDropdown>>", _apply_popdown, add="+")
+    cb.bind("<Button-1>", lambda _e: cb.after_idle(_apply_popdown), add="+")
+    cb.bind("<Down>", lambda _e: cb.after_idle(_apply_popdown), add="+")
+    try:
+        cb.after_idle(_apply_popdown)
+    except tk.TclError:
+        pass
+
+
 def bind_ttk_combobox_letter_jump_with_popdown(
     cb: ttk.Combobox,
     *,
@@ -5374,17 +5403,75 @@ def balance_amount_fg(value: Decimal) -> str:
     return COLOR_AMOUNT_NEG if value < 0 else COLOR_AMOUNT_POS
 
 
+def _macos_tk_app_root(widget: tk.Misc | None) -> tk.Misc | None:
+    """Risale al ``Tk`` radice (per cache icona Dock / ``iconphoto``)."""
+    if widget is None:
+        return None
+    w: tk.Misc | None = widget
+    for _ in range(32):
+        if w is None:
+            return widget
+        master = getattr(w, "master", None)
+        if master is None:
+            return w
+        w = master
+    return widget
+
+
+def _apply_macos_tk_iconphoto(app_root: tk.Misc | None) -> None:
+    """Imposta l'icona Tk di default (moneta euro) così Aqua non rimette l'icona Tk sui Toplevel."""
+    if app_root is None or platform.system() != "Darwin":
+        return
+    try:
+        photo = getattr(app_root, "_cdc_tk_dock_photo", None)
+        if photo is None:
+            import base64
+            from io import BytesIO
+
+            from PIL import Image, ImageTk
+
+            from euro_login_asset import EURO_JPEG_B64
+
+            raw = base64.standard_b64decode(EURO_JPEG_B64)
+            if not raw:
+                return
+            im = Image.open(BytesIO(raw)).convert("RGBA")
+            try:
+                resample = Image.Resampling.LANCZOS  # type: ignore[attr-defined]
+            except AttributeError:
+                resample = Image.LANCZOS
+            im.thumbnail((256, 256), resample)
+            photo = ImageTk.PhotoImage(im, master=app_root)
+            app_root._cdc_tk_dock_photo = photo  # type: ignore[attr-defined]
+        app_root.iconphoto(True, photo)
+    except Exception:
+        return
+
+
 def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = None) -> None:
     """Icona applicazione nel Dock macOS: stesso JPEG del login (``euro_login_asset``).
 
-    Non chiamare da subito dopo ``deiconify``: su Tk/Cocoa può causare SIGABRT intermittente.
-    Preferire ``root.after(...)`` (vedi ``_present_main_window``). JPEG → PNG via Pillow prima di
-    ``NSImage`` per evitare percorsi fragili del decoder AppKit su JPEG.
+    Tk/Aqua, alla creazione della root, sostituisce l'icona del bundle ``.app`` (moneta euro)
+    con quella predefinita Tk: va ripristinata **già in avvio** (root ancora ``withdraw()``),
+    non solo a UI principale pronta. Non chiamare nello stesso istante di ``deiconify`` della
+    finestra principale (SIGABRT intermittente): usare ``after(...)``. JPEG → PNG via Pillow
+    prima di ``NSImage`` per evitare percorsi fragili del decoder AppKit su JPEG.
     """
     if platform.system() != "Darwin":
         return
     if os.environ.get("CONTI_SKIP_DOCK_NATIVE", "").strip().lower() in ("1", "true", "yes", "on", "si"):
         return
+    app_root = _macos_tk_app_root(tk_anchor)
+    _apply_macos_tk_iconphoto(app_root)
+    cached = getattr(app_root, "_cdc_appkit_dock_icon", None) if app_root is not None else None
+    if cached is not None:
+        try:
+            from AppKit import NSApplication
+
+            NSApplication.sharedApplication().setApplicationIconImage_(cached)
+            return
+        except Exception:
+            pass
     try:
         import base64
         from io import BytesIO
@@ -5409,11 +5496,61 @@ def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = No
         if img is None:
             return
         NSApplication.sharedApplication().setApplicationIconImage_(img)
-        if tk_anchor is not None:
+        if app_root is not None:
             # Ancora riferimento su oggetto Tcl: evita finalizzazione PyObjC precoce del NSImage.
+            app_root._cdc_appkit_dock_icon = img  # type: ignore[attr-defined]
+        elif tk_anchor is not None:
             tk_anchor._cdc_appkit_dock_icon = img  # type: ignore[attr-defined]
     except Exception:
         return
+
+
+def install_macos_startup_dock_icon(root: tk.Tk) -> None:
+    """Moneta euro nel Dock già dai dialoghi di avvio/login, non solo a programma avviato.
+
+    Solo macOS. La root deve esistere (anche ``withdraw()``); Pillow già verificato.
+    """
+    if platform.system() != "Darwin":
+        return
+
+    def _apply() -> None:
+        try:
+            apply_macos_dock_icon_from_login_euro_jpeg(tk_anchor=root)
+        except Exception:
+            pass
+
+    try:
+        root._cdc_apply_macos_dock_icon = _apply  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    _apply()
+    for ms in (80, 250, 800):
+        try:
+            root.after(ms, _apply)
+        except Exception:
+            pass
+
+
+def schedule_macos_dock_icon_restore(widget: tk.Misc | None, *, delay_ms: int = 80) -> None:
+    """Dopo ``deiconify`` di un dialogo di avvio: ripristina l'icona Dock (Tk può averla sovrascritta)."""
+    if platform.system() != "Darwin" or widget is None:
+        return
+    app_root = _macos_tk_app_root(widget)
+    cb = getattr(app_root, "_cdc_apply_macos_dock_icon", None) if app_root is not None else None
+
+    def _go() -> None:
+        try:
+            if callable(cb):
+                cb()
+            else:
+                apply_macos_dock_icon_from_login_euro_jpeg(tk_anchor=widget)
+        except Exception:
+            pass
+
+    try:
+        widget.after(max(0, int(delay_ms)), _go)
+    except Exception:
+        _go()
 
 
 def _print_balances_native_macos(build_html: Callable[[float], str]) -> bool:
@@ -10148,6 +10285,7 @@ def build_ui(
         "MovCdc.TCombobox",
         font=_ui_font_tuple(12, "bold"),
         fieldbackground=CDC_ENTRY_FIELD_BG,
+        padding=(8, 4, 8, 4),
     )
 
     movimenti_frame = ttk.Frame(cdc_content, padding=8, style="MovCdc.TFrame")
@@ -10623,16 +10761,24 @@ def build_ui(
 
     # Zona filtri: compatta, per restare visibile anche con metrica font diversa tra macOS e Windows.
     filter_ui_font = _ui_font_tuple(10, "bold")
+    # Categorie/Conti: un gradino sopra i campi Importo/Assegno (10), sotto i tab pagina (13).
+    filter_combo_font = _ui_font_tuple(12, "bold")
+    _mov_combo_pad = (8, 5, 8, 5) if platform.system() == "Windows" else (8, 4, 8, 4)
     ttk.Style(root).configure("Filters.TLabel", font=filter_ui_font)
     ttk.Style(root).configure("Filters.TEntry", font=filter_ui_font)
-    ttk.Style(root).configure("Filters.TCombobox", font=filter_ui_font)
+    ttk.Style(root).configure("Filters.TCombobox", font=filter_combo_font)
     ttk.Style(root).configure("Filters.TButton", font=filter_ui_font)
     _mov_style = ttk.Style(root)
     _mov_style.configure("MovCdc.TLabel", font=filter_ui_font, background=MOVIMENTI_PAGE_BG, foreground=UI_FG_FILTER_LABEL)
     _mov_style.configure(
         "MovCdc.TEntry", font=filter_ui_font, fieldbackground=CDC_ENTRY_FIELD_BG, foreground=UI_FG_FILTER_ENTRY
     )
-    _mov_style.configure("MovCdc.TCombobox", font=filter_ui_font, fieldbackground=CDC_ENTRY_FIELD_BG)
+    _mov_style.configure(
+        "MovCdc.TCombobox",
+        font=filter_combo_font,
+        fieldbackground=CDC_ENTRY_FIELD_BG,
+        padding=_mov_combo_pad,
+    )
 
     _ALL_CATEGORIES_LABEL = "Categoria"
     _ALL_ACCOUNTS_LABEL = "Conto"
@@ -10649,11 +10795,13 @@ def build_ui(
         filters_text_inner,
         textvariable=text_category_preview_var,
         state="readonly",
-        width=14,
+        width=18,
         values=(_ALL_CATEGORIES_LABEL,),
         style="MovCdc.TCombobox",
+        font=filter_combo_font,
     )
     category_entry.pack(side=tk.LEFT, padx=(0, 6))
+    apply_ttk_combobox_display_font(category_entry, filter_combo_font)
     text_category_preview_var.set(_ALL_CATEGORIES_LABEL)
 
     _MOV_AGG_CAT_BTN_BG = "#1565c0"
@@ -10774,11 +10922,13 @@ def build_ui(
         filters_text_inner,
         textvariable=text_account_preview_var,
         state="readonly",
-        width=12,
+        width=16,
         values=(_ALL_ACCOUNTS_LABEL,),
         style="MovCdc.TCombobox",
+        font=filter_combo_font,
     )
     account_entry.pack(side=tk.LEFT, padx=(0, 8))
+    apply_ttk_combobox_display_font(account_entry, filter_combo_font)
     text_account_preview_var.set(_ALL_ACCOUNTS_LABEL)
 
     bind_ttk_combobox_prefix_letter_jump(
@@ -10894,11 +11044,13 @@ def build_ui(
         reg_controls_inner,
         textvariable=text_account_preview_var,
         state="readonly",
-        width=14,
+        width=16,
         values=(_ALL_ACCOUNTS_LABEL,),
         style="MovCdc.TCombobox",
+        font=filter_combo_font,
     )
     reg_account_entry.pack(side=tk.LEFT, padx=(0, 0))
+    apply_ttk_combobox_display_font(reg_account_entry, filter_combo_font)
     bind_ttk_combobox_prefix_letter_jump(
         reg_account_entry,
         on_pick=lambda nm, idx: (
@@ -16320,7 +16472,13 @@ th {{ background:#efefef; text-align:left; }}
     ttk.Style(root).configure(
         "NewReg.TEntry", font=newreg_ui_font, fieldbackground=MOVIMENTI_PAGE_BG, foreground="#111111"
     )
-    ttk.Style(root).configure("NewReg.TCombobox", font=newreg_ui_font, fieldbackground=MOVIMENTI_PAGE_BG)
+    _newreg_combo_pad = (10, 7, 10, 7) if platform.system() == "Windows" else (10, 6, 10, 6)
+    ttk.Style(root).configure(
+        "NewReg.TCombobox",
+        font=newreg_ui_font,
+        fieldbackground=MOVIMENTI_PAGE_BG,
+        padding=_newreg_combo_pad,
+    )
     ttk.Style(root).configure("NewReg.TButton", font=newreg_ui_font)
 
     _newreg_plain_lbl_kw: dict[str, object] = {
@@ -16419,8 +16577,10 @@ th {{ background:#efefef; text-align:left; }}
         state="readonly",
         width=_NR_W_CAT,
         style="NewReg.TCombobox",
+        font=newreg_ui_font,
     )
     cb_cat.grid(row=1, column=1, sticky="w", pady=_newreg_py)
+    apply_ttk_combobox_display_font(cb_cat, newreg_ui_font)
     nuova_form_head.columnconfigure(1, weight=0)
     nuova_form_head.grid_columnconfigure(2, weight=1)
 
@@ -16434,8 +16594,16 @@ th {{ background:#efefef; text-align:left; }}
 
     tk.Label(nuova_form, text="Conto", **_newreg_plain_lbl_kw).grid(row=0, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     row_conto_outer = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    cb_acc1 = ttk.Combobox(row_conto_outer, textvariable=newreg_acc1_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
+    cb_acc1 = ttk.Combobox(
+        row_conto_outer,
+        textvariable=newreg_acc1_var,
+        state="readonly",
+        width=_NR_W_ACC,
+        style="NewReg.TCombobox",
+        font=newreg_ui_font,
+    )
     cb_acc1.pack(side=tk.LEFT)
+    apply_ttk_combobox_display_font(cb_acc1, newreg_ui_font)
     btn_aggiorna_saldo = tk.Label(
         row_conto_outer,
         text="Aggiorna saldo di cassa",
@@ -16458,8 +16626,16 @@ th {{ background:#efefef; text-align:left; }}
     frm_saldo_below_btn = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     lbl_acc2 = tk.Label(nuova_form, text="Secondo conto", **_newreg_plain_lbl_kw)
     row_acc2_outer = tk.Frame(nuova_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    cb_acc2 = ttk.Combobox(row_acc2_outer, textvariable=newreg_acc2_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
+    cb_acc2 = ttk.Combobox(
+        row_acc2_outer,
+        textvariable=newreg_acc2_var,
+        state="readonly",
+        width=_NR_W_ACC,
+        style="NewReg.TCombobox",
+        font=newreg_ui_font,
+    )
     cb_acc2.pack(side=tk.LEFT)
+    apply_ttk_combobox_display_font(cb_acc2, newreg_ui_font)
     lbl_acc2.grid(row=1, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     row_acc2_outer.grid(row=1, column=1, columnspan=2, sticky="w", pady=_newreg_py)
 
@@ -18343,18 +18519,42 @@ th {{ background:#efefef; text-align:left; }}
     _per_refresh_cadence_button_styles()
     col_cad.grid(row=1, column=1, columnspan=3, sticky="nw", pady=_per_py)
     tk.Label(per_form, text="Categoria", **_newreg_plain_lbl_kw).grid(row=2, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
-    cb_per_cat = ttk.Combobox(per_form, textvariable=per_cat_var, state="readonly", width=_NR_W_CAT, style="NewReg.TCombobox")
+    cb_per_cat = ttk.Combobox(
+        per_form,
+        textvariable=per_cat_var,
+        state="readonly",
+        width=_NR_W_CAT,
+        style="NewReg.TCombobox",
+        font=newreg_ui_font,
+    )
     cb_per_cat.grid(row=2, column=1, columnspan=2, sticky="w", pady=_per_py)
+    apply_ttk_combobox_display_font(cb_per_cat, newreg_ui_font)
     tk.Label(per_form, textvariable=per_cat_note_var, **_newreg_cat_note_lbl_kw).grid(
         row=3, column=0, columnspan=3, sticky="w", pady=(0, 2)
     )
     tk.Label(per_form, text="Conto", **_newreg_plain_lbl_kw).grid(row=4, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
-    cb_per_acc1 = ttk.Combobox(per_form, textvariable=per_acc1_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
+    cb_per_acc1 = ttk.Combobox(
+        per_form,
+        textvariable=per_acc1_var,
+        state="readonly",
+        width=_NR_W_ACC,
+        style="NewReg.TCombobox",
+        font=newreg_ui_font,
+    )
     cb_per_acc1.grid(row=4, column=1, columnspan=2, sticky="w", pady=_per_py)
+    apply_ttk_combobox_display_font(cb_per_acc1, newreg_ui_font)
     lbl_per_acc2 = tk.Label(per_form, text="Secondo conto", **_newreg_plain_lbl_kw)
     row_per_acc2 = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    cb_per_acc2 = ttk.Combobox(row_per_acc2, textvariable=per_acc2_var, state="readonly", width=_NR_W_ACC, style="NewReg.TCombobox")
+    cb_per_acc2 = ttk.Combobox(
+        row_per_acc2,
+        textvariable=per_acc2_var,
+        state="readonly",
+        width=_NR_W_ACC,
+        style="NewReg.TCombobox",
+        font=newreg_ui_font,
+    )
     cb_per_acc2.pack(side=tk.LEFT)
+    apply_ttk_combobox_display_font(cb_per_acc2, newreg_ui_font)
     lbl_per_acc2.grid(row=5, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     row_per_acc2.grid(row=5, column=1, columnspan=2, sticky="w", pady=_per_py)
     tk.Label(per_form, text="Importo (€)", **_newreg_plain_lbl_kw).grid(row=6, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
@@ -20639,9 +20839,16 @@ th {{ background:#efefef; text-align:left; }}
     tk.Label(ver_setup_inner, text="Conto da verificare", font=_ver_setup_intro_font, bg=_VER_BG).grid(
         row=0, column=0, sticky="w", padx=(0, 8), pady=2
     )
-    ver_acc_combo = ttk.Combobox(ver_setup_inner, textvariable=ver_account_name_var, state="readonly", width=20,
-                                  style="NewReg.TCombobox")
+    ver_acc_combo = ttk.Combobox(
+        ver_setup_inner,
+        textvariable=ver_account_name_var,
+        state="readonly",
+        width=20,
+        style="NewReg.TCombobox",
+        font=_ver_setup_intro_font,
+    )
     ver_acc_combo.grid(row=0, column=1, sticky="w", pady=2, padx=(0, 16))
+    apply_ttk_combobox_display_font(ver_acc_combo, _ver_setup_intro_font)
     bind_ttk_combobox_prefix_letter_jump(
         ver_acc_combo,
         on_pick=lambda nm, idx: (
@@ -33644,7 +33851,12 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
                         fieldbackground=h,
                         foreground=_palette_runtime_attr("UI_FG_FILTER_ENTRY"),
                     )
-                    _mov_style.configure("MovCdc.TCombobox", font=filter_ui_font, fieldbackground=h)
+                    _mov_style.configure(
+                        "MovCdc.TCombobox",
+                        font=filter_combo_font,
+                        fieldbackground=h,
+                        padding=_mov_combo_pad,
+                    )
                     _nb_style.configure("MovCdc.TEntry", fieldbackground=h)
                     _nb_style.configure("MovCdc.TCombobox", fieldbackground=h)
                 except tk.TclError:
@@ -35585,6 +35797,7 @@ def _show_centered_info_dialog(parent: tk.Misc, title: str, message: str) -> Non
         win.after(400, _topmost_off)
         win.focus_force()
         win.grab_set()
+        schedule_macos_dock_icon_restore(win, delay_ms=80)
     except Exception:
         pass
 
@@ -35674,6 +35887,7 @@ def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:
         win.after(400, _topmost_off)
         win.focus_force()
         win.grab_set()
+        schedule_macos_dock_icon_restore(win, delay_ms=80)
     except Exception:
         pass
 
@@ -35717,6 +35931,13 @@ def main() -> None:
         except Exception:
             pass
         return
+
+    # macOS: Tk ha già sostituito l'icona Dock del bundle; ripristina la moneta euro
+    # prima dei dialoghi di avvio/login (root ancora nascosta = momento sicuro).
+    try:
+        install_macos_startup_dock_icon(root)
+    except Exception:
+        pass
 
     # Non mostrare la root qui: evita il flash di una cornice vuota prima del dialogo cartella dati / login
     # (i Toplevel usano ``parent`` anche con root ``withdraw()``).

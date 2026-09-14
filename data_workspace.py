@@ -432,6 +432,12 @@ def configure_data_workspace_interactive(parent) -> bool:
     tk.Button(btn_row, text="Esci", command=on_exit, width=10, **_cw_btn).pack(side=tk.LEFT)
 
     win.grab_set()
+    try:
+        cb = getattr(parent, "_cdc_apply_macos_dock_icon", None)
+        if callable(cb):
+            win.after(80, cb)
+    except Exception:
+        pass
     if dlg_parent is not None:
         try:
             win.update_idletasks()

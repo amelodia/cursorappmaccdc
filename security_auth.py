@@ -63,6 +63,11 @@ _FIRST_ACCESS_WIN_MIN_W = 480
 _FIRST_ACCESS_WIN_MIN_H = 360
 # ~0,5 cm di margine in più sotto il contenuto (padding inferiore del riquadro principale).
 _LOGIN_OUTER_PAD_BOTTOM_PX = 22
+# Windows + Sun Valley: dopo il primo glifo in un ttk.Entry ``show="•"`` le etichette
+# ttk vengono ridisegnate con altezza insufficiente (testo tagliato a metà).
+_WINDOWS_LOGIN_LABEL_PADY = 4
+_WINDOWS_LOGIN_ENTRY_IPADY = 4
+_WINDOWS_LOGIN_EXTRA_WIN_H = 20
 
 
 def _security_auth_package_dir() -> Path:
@@ -221,6 +226,13 @@ def _present_modal_dialog(win: tk.Toplevel, parent: tk.Tk) -> None:
                 win.after(100, lambda: win.attributes("-topmost", False))
             except Exception:
                 pass
+            # Tk/Aqua può rimpiazzare l'icona Dock all'apertura del dialogo: rimetti la moneta euro.
+            try:
+                cb = getattr(parent, "_cdc_apply_macos_dock_icon", None)
+                if callable(cb):
+                    win.after(80, cb)
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -331,6 +343,86 @@ def verify_password(up: dict, plain: str) -> bool:
         return False
 
 
+def _is_windows_ui() -> bool:
+    return platform.system() == "Windows"
+
+
+def _dialog_caption_label(
+    parent: tk.Misc,
+    text: str,
+    *,
+    font: tuple[Any, ...] = ("TkDefaultFont", 12),
+    bg: str | None = None,
+    style: str | None = None,
+) -> tk.Misc:
+    """Etichette del form di accesso.
+
+    Su Windows ``ttk.Label`` (tema Sun Valley) taglia i glifi a metà dopo l'immissione
+    nel campo password: si usa ``tk.Label`` con padding verticale esplicito.
+    """
+    if _is_windows_ui():
+        fill = bg
+        if not fill:
+            try:
+                fill = str(ttk.Style(parent).lookup("TFrame", "background") or "").strip() or None
+            except Exception:
+                fill = None
+        kw: dict[str, Any] = {
+            "text": text,
+            "font": font,
+            "anchor": "w",
+            "justify": "left",
+            "pady": _WINDOWS_LOGIN_LABEL_PADY,
+            "fg": CDC_TIPO_TASTI_BTN_FG,
+        }
+        if fill:
+            kw["bg"] = fill
+        return tk.Label(parent, **kw)
+    ttk_kw: dict[str, Any] = {"text": text, "font": font}
+    if style:
+        ttk_kw["style"] = style
+    return ttk.Label(parent, **ttk_kw)
+
+
+def _dialog_text_entry(
+    parent: tk.Misc,
+    textvariable: tk.StringVar,
+    *,
+    width: int,
+    show: str | None = None,
+    style: str | None = None,
+    bg: str | None = None,
+) -> tk.Misc:
+    """Campi email/password del form di accesso.
+
+    Su Windows ``ttk.Entry`` Sun Valley ha padding verticale 1px e campo a sprite:
+    il testo (e i «•» della password) risulta tagliato. ``tk.Entry`` evita il tema ttk.
+    """
+    if _is_windows_ui():
+        kw: dict[str, Any] = {
+            "textvariable": textvariable,
+            "width": width,
+            "font": ("TkDefaultFont", 12),
+            "relief": tk.SOLID,
+            "bd": 1,
+            "highlightthickness": 1,
+            "fg": CDC_TIPO_TASTI_BTN_FG,
+            "insertbackground": CDC_TIPO_TASTI_BTN_FG,
+            "bg": CDC_TIPO_TASTI_FIELD_BG if bg is None else bg,
+            "highlightbackground": "#d0c0b0",
+            "highlightcolor": CDC_TIPO_TASTI_BTN_RING,
+        }
+        if show:
+            kw["show"] = show
+        return tk.Entry(parent, **kw)
+    ttk_kw: dict[str, Any] = {"textvariable": textvariable, "width": width}
+    if style:
+        ttk_kw["style"] = style
+    if show:
+        ttk_kw["show"] = show
+    return ttk.Entry(parent, **ttk_kw)
+
+
 @dataclass
 class AppSession:
     """Stato sessione dopo il login."""
@@ -370,16 +462,25 @@ def run_first_access_wizard_if_needed(
     suffix_var = tk.StringVar()
     ttk.Entry(row1, textvariable=suffix_var, width=40).pack(side=tk.LEFT, padx=(6, 0))
 
-    ttk.Label(frm, text="Email (nome utente per gli accessi successivi)", font=("TkDefaultFont", 12)).pack(anchor=tk.W, pady=(14, 0))
+    _dialog_caption_label(
+        frm, "Email (nome utente per gli accessi successivi)", font=("TkDefaultFont", 12)
+    ).pack(anchor=tk.W, pady=(14, 0))
     email_var = tk.StringVar()
-    ttk.Entry(frm, textvariable=email_var, width=52).pack(anchor=tk.W, pady=(4, 0))
+    _win_ipady = _WINDOWS_LOGIN_ENTRY_IPADY if _is_windows_ui() else 0
+    _dialog_text_entry(frm, email_var, width=52).pack(anchor=tk.W, pady=(4, 0), ipady=_win_ipady)
 
-    ttk.Label(frm, text="Password (almeno 5 caratteri)", font=("TkDefaultFont", 12)).pack(anchor=tk.W, pady=(10, 0))
+    _dialog_caption_label(
+        frm, "Password (almeno 5 caratteri)", font=("TkDefaultFont", 12)
+    ).pack(anchor=tk.W, pady=(10, 0))
     pw1_var = tk.StringVar()
     pw2_var = tk.StringVar()
-    ttk.Entry(frm, textvariable=pw1_var, width=32, show="•").pack(anchor=tk.W, pady=(4, 2))
-    ttk.Label(frm, text="Ripeti password", font=("TkDefaultFont", 11)).pack(anchor=tk.W)
-    ttk.Entry(frm, textvariable=pw2_var, width=32, show="•").pack(anchor=tk.W, pady=(4, 0))
+    _dialog_text_entry(frm, pw1_var, width=32, show="•").pack(
+        anchor=tk.W, pady=(4, 2), ipady=_win_ipady
+    )
+    _dialog_caption_label(frm, "Ripeti password", font=("TkDefaultFont", 11)).pack(anchor=tk.W)
+    _dialog_text_entry(frm, pw2_var, width=32, show="•").pack(
+        anchor=tk.W, pady=(4, 0), ipady=_win_ipady
+    )
 
     err = tk.StringVar()
     ttk.Label(frm, textvariable=err, foreground="red", wraplength=480).pack(anchor=tk.W, pady=(8, 0))
@@ -467,6 +568,8 @@ def run_first_access_wizard_if_needed(
         sh = win.winfo_screenheight()
         rw = max(win.winfo_reqwidth(), _FIRST_ACCESS_WIN_MIN_W)
         rh = max(win.winfo_reqheight(), _FIRST_ACCESS_WIN_MIN_H)
+        if _is_windows_ui():
+            rh += _WINDOWS_LOGIN_EXTRA_WIN_H
         ww = min(rw, int(sw * 0.92))
         wh = min(rh, int(sh * 0.88))
         win.geometry(f"{ww}x{wh}+{(sw - ww) // 2}+{(sh - wh) // 3}")
@@ -581,18 +684,21 @@ def run_login_dialog(
 
     _login_style = ttk.Style(win)
     try:
-        _login_style.configure(
-            "CdcLogin.TLabel",
-            background=CDC_LOGIN_WIN_BG,
-            foreground=CDC_TIPO_TASTI_BTN_FG,
-        )
-        _login_style.configure(
-            "CdcLogin.TEntry",
-            fieldbackground=CDC_TIPO_TASTI_FIELD_BG,
-            foreground=CDC_TIPO_TASTI_BTN_FG,
-            insertcolor=CDC_TIPO_TASTI_BTN_FG,
-            font=("TkDefaultFont", 12),
-        )
+        _login_lbl_kw: dict[str, Any] = {
+            "background": CDC_LOGIN_WIN_BG,
+            "foreground": CDC_TIPO_TASTI_BTN_FG,
+        }
+        _login_ent_kw: dict[str, Any] = {
+            "fieldbackground": CDC_TIPO_TASTI_FIELD_BG,
+            "foreground": CDC_TIPO_TASTI_BTN_FG,
+            "insertcolor": CDC_TIPO_TASTI_BTN_FG,
+            "font": ("TkDefaultFont", 12),
+        }
+        if _is_windows_ui():
+            _login_lbl_kw["padding"] = (0, 6)
+            _login_ent_kw["padding"] = (8, 8, 8, 8)
+        _login_style.configure("CdcLogin.TLabel", **_login_lbl_kw)
+        _login_style.configure("CdcLogin.TEntry", **_login_ent_kw)
     except Exception:
         pass
 
@@ -641,19 +747,52 @@ def run_login_dialog(
             justify="center",
         )
 
-    ttk.Label(frm, text="Email", font=("TkDefaultFont", 12), style="CdcLogin.TLabel").grid(
-        row=email_row, column=0, sticky="w"
-    )
+    _win_lbl_pady = (2, 0) if _is_windows_ui() else (0, 0)
+    _win_entry_ipady = _WINDOWS_LOGIN_ENTRY_IPADY if _is_windows_ui() else 0
+    _dialog_caption_label(
+        frm,
+        "Email",
+        font=("TkDefaultFont", 12),
+        bg=CDC_LOGIN_WIN_BG,
+        style="CdcLogin.TLabel",
+    ).grid(row=email_row, column=0, sticky="w", pady=_win_lbl_pady)
     email_var = tk.StringVar(value=_login_prefill_email(up))
-    ent_email = ttk.Entry(frm, textvariable=email_var, width=38, style="CdcLogin.TEntry")
-    ent_email.grid(row=email_row + 1, column=0, columnspan=2, sticky="we", pady=(2, 8))
-
-    ttk.Label(frm, text="Password", font=("TkDefaultFont", 12), style="CdcLogin.TLabel").grid(
-        row=email_row + 2, column=0, sticky="w"
+    ent_email = _dialog_text_entry(
+        frm, email_var, width=38, style="CdcLogin.TEntry", bg=CDC_TIPO_TASTI_FIELD_BG
     )
+    ent_email.grid(
+        row=email_row + 1,
+        column=0,
+        columnspan=2,
+        sticky="we",
+        pady=(2, 8),
+        ipady=_win_entry_ipady,
+    )
+
+    _dialog_caption_label(
+        frm,
+        "Password",
+        font=("TkDefaultFont", 12),
+        bg=CDC_LOGIN_WIN_BG,
+        style="CdcLogin.TLabel",
+    ).grid(row=email_row + 2, column=0, sticky="w", pady=_win_lbl_pady)
     pw_var = tk.StringVar()
-    ent_pw = ttk.Entry(frm, textvariable=pw_var, width=38, show="•", style="CdcLogin.TEntry")
-    ent_pw.grid(row=email_row + 3, column=0, columnspan=2, sticky="we", pady=(2, 6))
+    ent_pw = _dialog_text_entry(
+        frm,
+        pw_var,
+        width=38,
+        show="•",
+        style="CdcLogin.TEntry",
+        bg=CDC_TIPO_TASTI_FIELD_BG,
+    )
+    ent_pw.grid(
+        row=email_row + 3,
+        column=0,
+        columnspan=2,
+        sticky="we",
+        pady=(2, 6),
+        ipady=_win_entry_ipady,
+    )
 
     out: list[tuple[bool, AppSession | None]] = [(False, None)]
     done_var = tk.BooleanVar(master=parent, value=False)
@@ -1024,6 +1163,8 @@ def run_login_dialog(
         sh = win.winfo_screenheight()
         rw = max(win.winfo_reqwidth(), _LOGIN_WIN_MIN_W)
         rh = max(win.winfo_reqheight(), _LOGIN_WIN_MIN_H)
+        if _is_windows_ui():
+            rh += _WINDOWS_LOGIN_EXTRA_WIN_H
         w = min(rw, int(sw * 0.92))
         h = min(rh, int(sh * 0.88))
         win.geometry(f"{w}x{h}+{(sw - w) // 2}+{(sh - h) // 3}")
