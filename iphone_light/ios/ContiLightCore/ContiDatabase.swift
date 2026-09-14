@@ -421,10 +421,14 @@ public enum ContiDatabase {
         return total
     }
 
-    /// Stesso nome del desktop: se il file esiste, la cartella dati è considerata in uso.
+    /// Stesso nome del desktop: se il file esiste ed è fresco, la cartella dati è in uso sul Mac.
+    /// Conti Light **non** crea né cancella questo file su Dropbox: create/delete/atomic sul File Provider
+    /// generano conflicted copies (anche del segnaposto) e rendono inutilizzabile la cartella.
     private static let dataFolderInUseMarkerFilename = "conti_di_casa_folder_in_use.txt"
+    /// Allineato a ``main_app._WORKSPACE_LOCK_STALE_SECONDS``.
+    private static let workspaceLockStaleSeconds: TimeInterval = 180
     private static let localInstanceMutex = NSLock()
-    /// Vero solo dopo creazione con successo di `conti_di_casa_folder_in_use.txt` in questa sessione: non va mai cancellato un segnaposto altrui.
+    /// Vero dopo ``acquireSessionWorkspaceLockForOpen`` in questa sessione (solo RAM; nessun file Dropbox).
     private static var sessionHoldsDataFolderMarkerOnDisk = false
     /// Contatore persist `.enc` in corso (thread-safe). Usato per non chiudere la sessione in background a metà scrittura.
     private static var activePersistCount = 0
@@ -489,39 +493,38 @@ public enum ContiDatabase {
         folder.standardizedFileURL.appendingPathComponent(dataFolderInUseMarkerFilename, isDirectory: false)
     }
 
-    private static func dataFolderInUseMarkerIsPresent(in folder: URL) -> Bool {
-        let fm = FileManager.default
-        let folderURL = folder.standardizedFileURL
-        guard let urls = try? fm.contentsOfDirectory(
-            at: folderURL,
-            includingPropertiesForKeys: nil,
-            options: []
-        ) else { return false }
-        guard let markerURL = urls.first(where: { $0.lastPathComponent == dataFolderInUseMarkerFilename }) else {
+    /// True solo se il desktop ha un segnaposto **canonico**, materializzato e non stantio.
+    /// Ignora le «conflicted copy» / «copia in conflitto» (non sono un lock valido).
+    private static func desktopWorkspaceLockIsActive(in folder: URL) -> Bool {
+        let markerURL = dataFolderInUseMarkerURL(in: folder)
+        let name = markerURL.lastPathComponent.lowercased()
+        if name.contains("conflicted copy") || name.contains("copia in conflitto") {
             return false
         }
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: markerURL.path, isDirectory: &isDirectory) else { return false }
-        return !isDirectory.boolValue
+        guard regularNonEmptyFileExists(at: markerURL) else {
+            return false
+        }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: markerURL.path),
+              let mtime = attrs[.modificationDate] as? Date else {
+            return false
+        }
+        return Date().timeIntervalSince(mtime) <= workspaceLockStaleSeconds
     }
 
-    private static func removeDataFolderInUseMarkerFileIfSafe(_ markerURL: URL, in folder: URL) {
-        let fm = FileManager.default
-        let folderURL = folder.standardizedFileURL
-        let url = markerURL.standardizedFileURL
-        guard url.deletingLastPathComponent().path == folderURL.path else { return }
-        guard url.lastPathComponent == dataFolderInUseMarkerFilename else { return }
-        var isDirectory: ObjCBool = false
-        guard fm.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return }
-        guard !isDirectory.boolValue else { return }
-        try? fm.removeItem(at: url)
+    private static func regularNonEmptyFileExists(at url: URL) -> Bool {
+        let path = url.path
+        guard FileManager.default.fileExists(atPath: path) else { return false }
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path) else { return false }
+        guard let typ = attrs[.type] as? FileAttributeType, typ == .typeRegular else { return false }
+        let size = (attrs[.size] as? NSNumber)?.int64Value ?? 0
+        return size > 0
     }
 
     public static func assertNoSessionWorkspaceLockBeforeOpen(in dataFolder: URL) throws {
-        if dataFolderInUseMarkerIsPresent(in: dataFolder.standardizedFileURL) {
+        if desktopWorkspaceLockIsActive(in: dataFolder.standardizedFileURL) {
             throw ContiLightImmissioneError.message(
-                "Avvio bloccato: la cartella dati risulta già in uso (file segnaposto presente nella cartella).\n\n"
-                    + "Chiudi l’altra app o attendi la sincronizzazione Dropbox."
+                "Avvio bloccato: l’app desktop risulta aperta sulla stessa cartella dati (file segnaposto fresco).\n\n"
+                    + "Chiudi Conti di casa sul computer e attendi la sincronizzazione Dropbox, poi riprova."
             )
         }
     }
@@ -596,40 +599,18 @@ public enum ContiDatabase {
         )
     }
 
-    private static func currentLockAppKind() -> String {
-        #if canImport(UIKit)
-        if UIDevice.current.userInterfaceIdiom == .pad {
-            return "ipad_light"
-        }
-        #endif
-        return "ios_light"
-    }
-
     private static func assertSafeToSave(_ encURL: URL) throws {
         let folder = encURL.deletingLastPathComponent().standardizedFileURL
+        try assertNoSessionWorkspaceLockBeforeOpen(in: folder)
         try assertNoDropboxConflictedEncFiles(in: folder)
     }
 
-    /// Dopo apertura riuscita del DB, crea il file segnaposto di questa sessione.
-    /// Non cancella nulla in apertura: il segnaposto viene rimosso solo in ``releaseSessionWorkspaceLockOnClose``.
+    /// Dopo apertura riuscita del DB: stato sessione solo in RAM.
+    /// Non scrive ``conti_di_casa_folder_in_use.txt`` su Dropbox (create/delete lì → conflicted copies).
     public static func acquireSessionWorkspaceLockForOpen(in dataFolder: URL, appKind: String = "") throws {
+        _ = appKind
         let folder = dataFolder.standardizedFileURL
-        let p = dataFolderInUseMarkerURL(in: folder)
         try assertNoSessionWorkspaceLockBeforeOpen(in: folder)
-        let kindTrim = appKind.trimmingCharacters(in: .whitespacesAndNewlines)
-        let line = (kindTrim.isEmpty ? currentLockAppKind() : kindTrim) + "\n"
-        guard let data = line.data(using: .utf8) else {
-            throw ContiLightImmissioneError.message("Impossibile creare il segnaposto di sessione.")
-        }
-        guard FileManager.default.createFile(atPath: p.path, contents: data, attributes: nil) else {
-            if dataFolderInUseMarkerIsPresent(in: folder) {
-                throw ContiLightImmissioneError.message(
-                    "Avvio bloccato: la cartella dati risulta già in uso (file segnaposto presente nella cartella).\n\n"
-                        + "Chiudi l’altra app o attendi la sincronizzazione Dropbox."
-                )
-            }
-            throw ContiLightImmissioneError.message("Impossibile creare il segnaposto di sessione.")
-        }
         localInstanceMutex.lock()
         sessionHoldsDataFolderMarkerOnDisk = true
         localInstanceMutex.unlock()
@@ -642,16 +623,10 @@ public enum ContiDatabase {
         localInstanceMutex.unlock()
     }
 
-    /// Chiusura sessione light: azzera lo stato in RAM; rimuove il segnaposto **solo** se l’aveva creato questa istanza.
+    /// Chiusura sessione light: azzera lo stato in RAM (nessun file Dropbox da rimuovere).
     public static func releaseSessionWorkspaceLockOnClose(in dataFolder: URL) {
-        let folder = dataFolder.standardizedFileURL
-        localInstanceMutex.lock()
-        let shouldRemove = sessionHoldsDataFolderMarkerOnDisk
-        sessionHoldsDataFolderMarkerOnDisk = false
-        localInstanceMutex.unlock()
-        if shouldRemove {
-            removeDataFolderInUseMarkerFileIfSafe(dataFolderInUseMarkerURL(in: folder), in: folder)
-        }
+        _ = dataFolder
+        clearLocalInstanceSessionState()
     }
 
     /// Lettura contenuto file dentro `coordinate`; per Dropbox+.enc più passaggi e pause lunghe perché anche «Aggiorna»
@@ -2644,7 +2619,8 @@ public enum ContiDatabase {
         }
     }
 
-    /// Cifratura Fernet + scrittura atomica (senza controlli cartella: uso interno dopo ``assertSafeToSave``).
+    /// Cifratura Fernet + scrittura che **preserva l’identità** del file Dropbox.
+    /// ``Data.write(.atomic)`` nella cartella File Provider crea un file nuovo (temp+rename) → conflicted copy.
     private static func writeFernetEncryptedDb(db: [String: Any], encURL: URL, keyString: String) throws {
         guard let enc = FernetEncryptor(keyFileContents: keyString) else {
             throw ContiDBError.cannotEncrypt
@@ -2657,7 +2633,62 @@ public enum ContiDatabase {
             withIntermediateDirectories: true
         )
         guard let outData = tokenUtf8.data(using: .utf8) else { throw ContiDBError.cannotEncrypt }
-        try outData.write(to: encURL, options: .atomic)
+        try writeDataPreservingCloudIdentity(outData, to: encURL)
+    }
+
+    /// Fuori da Dropbox: scrittura atomica classica. Su Dropbox/File Provider: coordinator + overwrite in-place
+    /// (stesso file, niente `.tmp` nella cartella sincronizzata).
+    private static func writeDataPreservingCloudIdentity(_ data: Data, to destURL: URL) throws {
+        if !pathLooksUnderDropbox(destURL) {
+            try data.write(to: destURL, options: .atomic)
+            return
+        }
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinatorError: NSError?
+        var writeError: Error?
+        coordinator.coordinate(
+            writingItemAt: destURL,
+            options: [.forReplacing],
+            error: &coordinatorError
+        ) { writeURL in
+            do {
+                let fm = FileManager.default
+                if fm.fileExists(atPath: writeURL.path) {
+                    do {
+                        let handle = try FileHandle(forWritingTo: writeURL)
+                        defer { try? handle.close() }
+                        try handle.seek(toOffset: 0)
+                        try handle.write(contentsOf: data)
+                        try handle.truncate(atOffset: UInt64(data.count))
+                        try handle.synchronize()
+                    } catch {
+                        // Fallback: tmp **fuori** da Dropbox + replaceItemAt (identità del documento).
+                        let tmp = fm.temporaryDirectory.appendingPathComponent(
+                            "conti-light-\(UUID().uuidString).tmp",
+                            isDirectory: false
+                        )
+                        try data.write(to: tmp, options: .atomic)
+                        defer { try? fm.removeItem(at: tmp) }
+                        _ = try fm.replaceItemAt(
+                            writeURL,
+                            withItemAt: tmp,
+                            backupItemName: nil,
+                            options: []
+                        )
+                    }
+                } else {
+                    try data.write(to: writeURL, options: [])
+                }
+            } catch {
+                writeError = error
+            }
+        }
+        if let coordinatorError {
+            throw coordinatorError
+        }
+        if let writeError {
+            throw writeError
+        }
     }
 
     /// Scrive un database cifrato (stesso formato del desktop). Usato da Conti Light solo per ``*_light.enc``.

@@ -61,8 +61,23 @@ def light_enc_path_for_primary(primary_enc: Path) -> Path:
 
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Scrive ``data`` su ``path``.
+
+    Se il file esiste già, overwrite **in-place** (stessa identità Dropbox). Un ``os.replace`` da un
+    ``.tmp`` *nella cartella sincronizzata* è la causa tipica di conflicted copies con iOS File Provider.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    if path.is_file():
+        with path.open("r+b") as dest:
+            dest.seek(0)
+            dest.write(data)
+            dest.truncate()
+            dest.flush()
+            os.fsync(dest.fileno())
+        return
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(tempfile.gettempdir())
+    )
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as f:

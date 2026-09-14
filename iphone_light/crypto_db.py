@@ -39,7 +39,17 @@ def load_encrypted_db(output_path: Path, key_path: Path) -> dict | None:
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    if path.is_file():
+        with path.open("r+b") as dest:
+            dest.seek(0)
+            dest.write(data)
+            dest.truncate()
+            dest.flush()
+            os.fsync(dest.fileno())
+        return
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(tempfile.gettempdir())
+    )
     tmp = Path(tmp_name)
     try:
         with os.fdopen(fd, "wb") as f:

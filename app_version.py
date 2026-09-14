@@ -11,5 +11,5 @@ oppure lanciando ``scripts/build_macos_app.sh`` (che invoca lo script prima di P
 
 APP_VERSION_MAJOR = 11
 APP_VERSION_MINOR = 3
-APP_VERSION_BUILD = 3
+APP_VERSION_BUILD = 4
 APP_VERSION = f"{APP_VERSION_MAJOR}.{APP_VERSION_MINOR}.{APP_VERSION_BUILD}"

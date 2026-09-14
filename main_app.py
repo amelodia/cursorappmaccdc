@@ -9344,6 +9344,8 @@ def _data_folder_in_use_marker_path(data_dir: Path) -> Path:
 
 def _is_data_folder_in_use_marker_name(name: str) -> bool:
     n = name.lower()
+    if "conflicted copy" in n or "copia in conflitto" in n:
+        return False
     return n.startswith("conti_di_casa_folder_in_use") and n.endswith(".txt")
 
 

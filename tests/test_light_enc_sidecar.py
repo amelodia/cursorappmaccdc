@@ -167,6 +167,22 @@ class LightEncSidecarMergeTests(unittest.TestCase):
         n_new, n_up = merge_light_sidecar_into_main(main, light)
         self.assertEqual((n_new, n_up), (0, 0))
 
+    def test_inplace_write_keeps_inode_and_leaves_no_tmp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from light_enc_sidecar import _atomic_write_bytes
+
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "conti_utente_abc_light.enc"
+            _atomic_write_bytes(p, b"aaa")
+            inode = p.stat().st_ino
+            _atomic_write_bytes(p, b"bbbbbb")
+            self.assertEqual(p.read_bytes(), b"bbbbbb")
+            self.assertEqual(p.stat().st_ino, inode)
+            leftovers = [x.name for x in Path(td).iterdir() if x.name != p.name]
+            self.assertEqual(leftovers, [])
+
 
 if __name__ == "__main__":
     unittest.main()
