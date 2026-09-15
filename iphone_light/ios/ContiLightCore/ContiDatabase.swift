@@ -112,7 +112,8 @@ extension ContiDBError: LocalizedError {
 }
 
 /// Caricamento DB e login allineati a `iphone_light/light_auth.py` + `crypto_db.py`.
-public enum ContiDatabase {
+/// `nonisolated`: I/O file e attesa Dropbox devono restare fuori dal MainActor (login in background, Allinea).
+nonisolated public enum ContiDatabase {
     public typealias LightSaldiTotalsNonCc = (
         abs: Decimal,
         sf: Decimal,
@@ -308,7 +309,7 @@ public enum ContiDatabase {
     }
 
     /// Stem `conti_utente_<20 hex>` (stesso criterio di `perUserEncURL`, senza `.enc`).
-    public static func userEncFilenameStem(forEmail email: String) -> String {
+    public nonisolated static func userEncFilenameStem(forEmail email: String) -> String {
         let em = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let digest = SHA256.hash(data: Data(em.utf8))
         let hex = digest.map { String(format: "%02x", $0) }.joined().prefix(20)
@@ -316,13 +317,13 @@ public enum ContiDatabase {
     }
 
     /// Solo sidecar **light** (mai il `.enc` pieno), nella stessa cartella del `.key`.
-    public static func userDatabaseEncURLCandidates(inFolder folder: URL, email: String) -> [URL] {
+    public nonisolated static func userDatabaseEncURLCandidates(inFolder folder: URL, email: String) -> [URL] {
         let stem = userEncFilenameStem(forEmail: email)
         let dir = folder.standardizedFileURL
         return [dir.appendingPathComponent("\(stem)_light.enc", isDirectory: false)]
     }
 
-    public static func firstExistingURL(in candidates: [URL]) -> URL? {
+    public nonisolated static func firstExistingURL(in candidates: [URL]) -> URL? {
         for u in candidates {
             if FileManager.default.fileExists(atPath: u.path) { return u }
         }
@@ -330,7 +331,7 @@ public enum ContiDatabase {
     }
 
     /// File `*_light.enc` per l’email; mai database completi.
-    public static func resolvePrimaryEncURL(inFolder folder: URL, email: String) -> URL? {
+    public nonisolated static func resolvePrimaryEncURL(inFolder folder: URL, email: String) -> URL? {
         firstExistingURL(in: userDatabaseEncURLCandidates(inFolder: folder, email: email))
     }
 
@@ -351,17 +352,139 @@ public enum ContiDatabase {
         }.first
     }
 
-    /// Euristica Dropbox (analoga a `cloud_sync_wait.path_looks_under_dropbox` del desktop).
-    public static func pathLooksUnderDropbox(_ url: URL) -> Bool {
+    /// Euristica Dropbox / Files (analoga a `cloud_sync_wait.path_looks_under_dropbox` del desktop).
+    /// Su iPhone il path del File Provider è spesso `…/File Provider Storage/…` o `com.getdropbox.Dropbox`,
+    /// **senza** `/Dropbox/` come sul Mac: senza questi match l’app trattava il file come locale e leggeva la cache.
+    public nonisolated static func pathLooksUnderDropbox(_ url: URL) -> Bool {
         let p = url.standardizedFileURL.path.lowercased()
         if p.contains("/cloudstorage/dropbox") { return true }
         if p.contains("/dropbox/") { return true }
         if p.contains("/dropbox-") { return true }
         if p.contains("/dropbox (") { return true }
+        if p.contains("dropbox") { return true }
+        if p.contains("fileprovider") { return true }
+        if p.contains("file provider storage") { return true }
+        if p.contains("/file provider/") { return true }
         return false
     }
 
-    private static func fileFingerprint(_ url: URL) -> (size: NSNumber, mtime: Date)? {
+    /// `URL.removeAllCachedResourceValues()` è `mutating`; NSURL espone lo stesso senza copia del path.
+    private nonisolated static func dropResourceValueCache(_ url: URL) {
+        (url as NSURL).removeAllCachedResourceValues()
+    }
+
+    /// Elenco `*_light.enc` nella cartella (per riallineare anche senza email già inserita).
+    public nonisolated static func lightEncURLs(inFolder folder: URL) -> [URL] {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return urls.filter { $0.lastPathComponent.lowercased().hasSuffix("_light.enc") }
+            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    private nonisolated static func bumpFileProviderDirectoryListing(_ folder: URL) {
+        dropResourceValueCache(folder)
+        _ = try? FileManager.default.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: [
+                .contentModificationDateKey,
+                .fileSizeKey,
+                .ubiquitousItemDownloadingStatusKey,
+                .ubiquitousItemIsDownloadingKey,
+            ],
+            options: [.skipsHiddenFiles]
+        )
+    }
+
+    /// Chiede al File Provider (Dropbox/Files) la copia **cloud**, non quella materializzata all’ultimo accesso.
+    /// `forceEvict`: scarta la copia locale (spesso ferma all’app scaduta) e la riscarica; va usato al login / «Allinea».
+    @discardableResult
+    public nonisolated static func requestFreshCloudMaterialization(
+        of url: URL,
+        forceEvict: Bool,
+        maxWaitSeconds: TimeInterval = 45
+    ) -> TimeInterval {
+        guard pathLooksUnderDropbox(url) else { return 0 }
+        let t0 = Date().timeIntervalSinceReferenceDate
+        dropResourceValueCache(url)
+        bumpFileProviderDirectoryListing(url.deletingLastPathComponent())
+
+        if forceEvict {
+            do {
+                try FileManager.default.evictUbiquitousItem(at: url)
+            } catch {
+                // Non ubiquo, o provider che non espone evict: si continua con download + lettura.
+            }
+        }
+        do {
+            try FileManager.default.startDownloadingUbiquitousItem(at: url)
+        } catch {
+            // Stesso caso: la lettura coordinata può comunque idratare il placeholder.
+        }
+
+        let deadline = t0 + maxWaitSeconds
+        let poll: TimeInterval = 0.25
+        let minWait: TimeInterval = forceEvict ? 0.8 : 0
+        while Date().timeIntervalSinceReferenceDate < deadline {
+            dropResourceValueCache(url)
+            let values = try? url.resourceValues(forKeys: [
+                .ubiquitousItemIsDownloadingKey,
+                .ubiquitousItemDownloadingStatusKey,
+                .fileSizeKey,
+            ])
+            let downloading = values?.ubiquitousItemIsDownloading ?? false
+            let status = values?.ubiquitousItemDownloadingStatus
+            let exists = FileManager.default.fileExists(atPath: url.path)
+            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+            let waited = Date().timeIntervalSinceReferenceDate - t0
+            if waited >= minWait, exists, size > 0, !downloading {
+                if forceEvict {
+                    if status == nil || status == .current {
+                        break
+                    }
+                    // `.downloaded` dopo evict può essere ancora la copia vecchia: attendi `.current` o il timeout.
+                    if status == .downloaded, waited >= min(12, maxWaitSeconds) {
+                        break
+                    }
+                } else {
+                    break
+                }
+            }
+            Thread.sleep(forTimeInterval: poll)
+        }
+        return Date().timeIntervalSinceReferenceDate - t0
+    }
+
+    /// Evict + download dei `*_light.enc` (email nota, altrimenti tutti i sidecar nella cartella).
+    public nonisolated static func realignLightEncFilesFromCloud(in folder: URL, email: String) -> String {
+        bumpFileProviderDirectoryListing(folder)
+        let em = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let targets: [URL]
+        if !em.isEmpty, let one = resolvePrimaryEncURL(inFolder: folder, email: em) {
+            targets = [one]
+        } else {
+            targets = lightEncURLs(inFolder: folder)
+        }
+        if targets.isEmpty {
+            if em.isEmpty {
+                return "Nessun file *_light.enc nella cartella. Inserisci l’email oppure controlla in File / Dropbox."
+            }
+            let stem = userEncFilenameStem(forEmail: em)
+            return "File light non trovato (atteso: \(stem)_light.enc). Apri Dropbox, attendi la sync, poi riseleziona la cartella."
+        }
+        for u in targets {
+            _ = requestFreshCloudMaterialization(of: u, forceEvict: true)
+            _ = waitForFileStableIfDropbox(u, maxWaitSeconds: 60)
+        }
+        let names = targets.map(\.lastPathComponent).joined(separator: ", ")
+        return "Richiesta a Dropbox completata per \(names). Controlla la data «aggiornato» qui sotto: deve coincidere con quella in Dropbox, poi tocca Accedi."
+    }
+
+    private nonisolated static func fileFingerprint(_ url: URL) -> (size: NSNumber, mtime: Date)? {
+        dropResourceValueCache(url)
         guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
               let size = attrs[.size] as? NSNumber,
               let mtime = attrs[.modificationDate] as? Date else { return nil }
@@ -371,7 +494,7 @@ public enum ContiDatabase {
     /// Attende che `(size, mtime)` del file resti invariato per `stableSeconds`.
     /// Torna i secondi di attesa effettivi (0 se non Dropbox o file già stabile).
     @discardableResult
-    public static func waitForFileStableIfDropbox(
+    public nonisolated static func waitForFileStableIfDropbox(
         _ url: URL,
         stableSeconds: TimeInterval = 1.6,
         pollSeconds: TimeInterval = 0.25,
@@ -459,11 +582,13 @@ public enum ContiDatabase {
         #if canImport(UIKit)
         var bgTaskId = UIBackgroundTaskIdentifier.invalid
         let startBg = {
-            bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "ContiLightPersistEnc") {
-                let id = bgTaskId
-                bgTaskId = .invalid
-                if id != .invalid {
-                    UIApplication.shared.endBackgroundTask(id)
+            MainActor.assumeIsolated {
+                bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "ContiLightPersistEnc") {
+                    let id = bgTaskId
+                    bgTaskId = .invalid
+                    if id != .invalid {
+                        UIApplication.shared.endBackgroundTask(id)
+                    }
                 }
             }
         }
@@ -474,9 +599,11 @@ public enum ContiDatabase {
         }
         defer {
             let endBg = {
-                if bgTaskId != .invalid {
-                    UIApplication.shared.endBackgroundTask(bgTaskId)
-                    bgTaskId = .invalid
+                MainActor.assumeIsolated {
+                    if bgTaskId != .invalid {
+                        UIApplication.shared.endBackgroundTask(bgTaskId)
+                        bgTaskId = .invalid
+                    }
                 }
             }
             if Thread.isMainThread {
@@ -629,17 +756,51 @@ public enum ContiDatabase {
         clearLocalInstanceSessionState()
     }
 
-    /// Lettura contenuto file dentro `coordinate`; per Dropbox+.enc più passaggi e pause lunghe perché anche «Aggiorna»
-    /// nella stessa sessione può rileggere la stessa copia cached del provider — serve tempo tra una lettura e l’altra
-    /// (equivalente pragmatico del «secondo avvio» dell’app).
+    /// Copia nel sandbox dell’app: `Data(contentsOf:)` sul URL File Provider può mmap la cache locale stantia.
+    private static func copyProviderFileToTemporary(_ readURL: URL) throws -> URL {
+        let fm = FileManager.default
+        let tmp = fm.temporaryDirectory.appendingPathComponent(
+            "conti-light-read-\(UUID().uuidString).enc",
+            isDirectory: false
+        )
+        if fm.fileExists(atPath: tmp.path) {
+            try fm.removeItem(at: tmp)
+        }
+        var lastError: Error = ContiDBError.cannotReadEnc
+        for i in 0..<8 {
+            do {
+                if fm.fileExists(atPath: tmp.path) {
+                    try fm.removeItem(at: tmp)
+                }
+                try fm.copyItem(at: readURL, to: tmp)
+                let size = (try fm.attributesOfItem(atPath: tmp.path)[.size] as? NSNumber)?.int64Value ?? 0
+                if size > 0 {
+                    return tmp
+                }
+                lastError = ContiDBError.cannotReadEnc
+            } catch {
+                lastError = error
+            }
+            Thread.sleep(forTimeInterval: 0.35 + Double(i) * 0.25)
+        }
+        throw lastError
+    }
+
+    /// Lettura contenuto file dentro `coordinate`. Copia in temp + seconda passata: il File Provider Dropbox
+    /// su iOS può consegnare a `Data(contentsOf:)` la stessa copia materializzata all’ultimo accesso.
     private static func coordinatedReadUncachedPreferringHydrated(dropboxEncURL readURL: URL) throws -> Data {
         precondition(pathLooksUnderDropbox(readURL))
-        var data = try Data(contentsOf: readURL, options: [.uncached])
-        // Ritardi ispirati a sync provider: dopo 0,7 s e 2,0 s molti File Provider consegnano il blob aggiornato.
+        dropResourceValueCache(readURL)
+        let tmp1 = try copyProviderFileToTemporary(readURL)
+        defer { try? FileManager.default.removeItem(at: tmp1) }
+        var data = try Data(contentsOf: tmp1, options: [.uncached])
         Thread.sleep(forTimeInterval: 0.7)
-        data = try Data(contentsOf: readURL, options: [.uncached])
-        Thread.sleep(forTimeInterval: 2.0)
-        data = try Data(contentsOf: readURL, options: [.uncached])
+        let tmp2 = try copyProviderFileToTemporary(readURL)
+        defer { try? FileManager.default.removeItem(at: tmp2) }
+        let again = try Data(contentsOf: tmp2, options: [.uncached])
+        if again != data {
+            data = again
+        }
         return data
     }
 

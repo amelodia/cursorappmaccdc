@@ -109,6 +109,8 @@ struct ContentView: View {
     @State private var lastScenePhaseRefreshAt: Date = .distantPast
     /// Se l’app va in background a metà salvataggio, chiudi la sessione solo a scrittura completata.
     @State private var closeSessionWhenPersistEnds = false
+    /// Evict + riscaricamento `*_light.enc` da Dropbox/Files (login e tasto Allinea).
+    @State private var isAligningCloud = false
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -138,9 +140,7 @@ struct ContentView: View {
                         password: password,
                         onPersisted: { updatedDb, _, note in
                             loggedInSessionDb = updatedDb as NSDictionary
-                            if let d = updatedDb as? [String: Any] {
-                                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
-                            }
+                            loggedInRecords = ContiDatabase.displayRecords(from: updatedDb, sort: movimentiListSort)
                             message = note
                         }
                     )
@@ -154,9 +154,7 @@ struct ContentView: View {
                         password: password,
                         onPersisted: { updatedDb, _, note in
                             loggedInSessionDb = updatedDb as NSDictionary
-                            if let d = updatedDb as? [String: Any] {
-                                loggedInRecords = ContiDatabase.displayRecords(from: d, sort: movimentiListSort)
-                            }
+                            loggedInRecords = ContiDatabase.displayRecords(from: updatedDb, sort: movimentiListSort)
                             message = note
                         },
                         editingLegacyKey: legacyKey
@@ -259,11 +257,20 @@ struct ContentView: View {
         if !trimmed.isEmpty { return message }
         if dataFolderURL == nil {
             return """
-            Scegli la cartella dati (stesso .key, *_light.enc e .enc completo del desktop, nella stessa cartella), \
-            poi email e password. L’app apre il .enc light corretto per la tua email.
+            Tocca «Scegli cartella…», in basso a sinistra «Sfoglia», poi Dropbox → ContiCursor \
+            (la cartella dei file dati del desktop: .key e *_light.enc). \
+            Non usare la cartella ContiLight (è solo il progetto Xcode). \
+            Non toccare i singoli file: premi «Apri» sulla cartella ContiCursor.
             """
         }
-        return "Cartella dati già memorizzata. Inserisci email e password, poi tocca Accedi."
+        let folderName = dataFolderURL?.lastPathComponent ?? ""
+        if folderName.compare("ContiCursor", options: [.caseInsensitive, .diacriticInsensitive]) != .orderedSame {
+            return """
+            La cartella memorizzata è «\(folderName)». I file dati stanno in Dropbox/ContiCursor, \
+            non in ContiLight. Tocca «Cambia cartella…» e apri ContiCursor.
+            """
+        }
+        return "Cartella ContiCursor memorizzata. Inserisci email e password, poi tocca Accedi."
     }
 
     private var loginForm: some View {
@@ -309,7 +316,7 @@ struct ContentView: View {
                         }
                         .frame(maxWidth: .infinity)
                     }
-                    .disabled(isBusy)
+                    .disabled(isBusy || isAligningCloud)
                 }
                 Button(action: loginWithPassword) {
                     HStack {
@@ -320,12 +327,14 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
-                .disabled(isBusy || dataFolderURL == nil || email.isEmpty || password.isEmpty)
+                .disabled(isBusy || isAligningCloud || dataFolderURL == nil || email.isEmpty || password.isEmpty)
             }
             if dataFolderURL == nil {
                 Section("Cartella dati") {
                     Text(
-                        "Apri la cartella dati del desktop: qui ci sono il .key, il file *_light.enc e (opzionale) il .enc completo. Non selezionare un singolo file."
+                        "Nel selettore: Sfoglia → Dropbox → ContiCursor. " +
+                            "È la stessa cartella del desktop (conti_di_casa.key e *_light.enc). " +
+                            "Non aprire ContiLight (progetto Xcode) e non selezionare un file .enc."
                     )
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -355,6 +364,24 @@ struct ContentView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    Text(
+                        "Controlla che il nome cartella sia ContiCursor. " +
+                            "La data «aggiornato» è la copia vista da File (non dall’app Dropbox). " +
+                            "Se non coincide, tocca «Allinea file con Dropbox» oppure «Cambia cartella…» e riseleziona ContiCursor, poi Accedi."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    Button {
+                        Task { await alignLightFileFromCloud() }
+                    } label: {
+                        HStack {
+                            if isAligningCloud {
+                                ProgressView()
+                            }
+                            Text(isAligningCloud ? "Allineamento Dropbox…" : "Allinea file con Dropbox")
+                        }
+                    }
+                    .disabled(isBusy || isAligningCloud)
                     Button("Cambia cartella…") {
                         folderPickRequest = FolderPickRequest()
                     }
@@ -386,15 +413,23 @@ struct ContentView: View {
                         let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
                         guard isDirectory else {
                             message = """
-                            Hai selezionato un file, non una cartella. Nel selettore, apri la cartella dei dati \
-                            (es. `data`) e premi «Apri» sulla cartella — non sul file .key o .enc.
+                            Hai selezionato un file, non una cartella. Nel selettore: Sfoglia → Dropbox → ContiCursor, \
+                            poi «Apri» sulla cartella — non sul file .key o .enc. Non usare la cartella ContiLight.
                             """
                             return
                         }
                         ContiLightFolderBookmark.save(url)
                         dataFolderURL = url
                         refreshKeyStatus()
-                        message = "Cartella impostata. Inserisci email e password, poi Accedi."
+                        let name = url.lastPathComponent
+                        if name.compare("ContiLight", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
+                            message = """
+                            Hai aperto la cartella ContiLight (progetto Xcode). I file dati non sono lì. \
+                            Tocca di nuovo «Cambia cartella…» e apri Dropbox → ContiCursor.
+                            """
+                        } else {
+                            message = "Cartella «\(name)» impostata. Inserisci email e password, poi Accedi."
+                        }
                     }
                 },
                 onCancel: {
@@ -421,6 +456,7 @@ struct ContentView: View {
             return
         }
         defer { folder.stopAccessingSecurityScopedResource() }
+        (folder as NSURL).removeAllCachedResourceValues()
         if let k = ContiDatabase.preferredKeyFileURL(inFolder: folder) {
             keyStatusText = "Chiave: \(k.lastPathComponent)"
         } else {
@@ -428,17 +464,7 @@ struct ContentView: View {
         }
         let em = email.trimmingCharacters(in: .whitespacesAndNewlines)
         if let light = ContiDatabase.resolvePrimaryEncURL(inFolder: folder, email: em) {
-            let attrs = try? FileManager.default.attributesOfItem(atPath: light.path)
-            let mtime = attrs?[.modificationDate] as? Date
-            if let d = mtime {
-                let f = DateFormatter()
-                f.locale = Locale(identifier: "it_IT")
-                f.timeZone = .current
-                f.dateFormat = "dd/MM/yyyy HH:mm:ss"
-                lightFileStatusText = "File light: \(light.lastPathComponent) — aggiornato: \(f.string(from: d))"
-            } else {
-                lightFileStatusText = "File light: \(light.lastPathComponent)"
-            }
+            lightFileStatusText = cloudFileStatusLine(prefix: "File light", url: light)
         } else {
             let stem = ContiDatabase.userEncFilenameStem(forEmail: em)
             lightFileStatusText = "File light non trovato (atteso: \(stem)_light.enc nella cartella)."
@@ -446,14 +472,8 @@ struct ContentView: View {
         if !em.isEmpty {
             let stemName = ContiDatabase.userEncFilenameStem(forEmail: em)
             let full = folder.appendingPathComponent("\(stemName).enc", isDirectory: false)
-            let attrs = try? FileManager.default.attributesOfItem(atPath: full.path)
-            let mtime = attrs?[.modificationDate] as? Date
-            if let d = mtime {
-                let f = DateFormatter()
-                f.locale = Locale(identifier: "it_IT")
-                f.timeZone = .current
-                f.dateFormat = "dd/MM/yyyy HH:mm:ss"
-                fullFileStatusText = "File completo: \(full.lastPathComponent) — aggiornato: \(f.string(from: d))"
+            if FileManager.default.fileExists(atPath: full.path) {
+                fullFileStatusText = cloudFileStatusLine(prefix: "File completo", url: full)
             } else {
                 fullFileStatusText = "File completo non trovato per questa email (\(full.lastPathComponent))."
             }
@@ -462,6 +482,60 @@ struct ContentView: View {
         }
         // Aggiorna il bookmark su disco: evita che al prossimo avvio iOS lo consideri obsoleto e «perda» la cartella.
         ContiLightFolderBookmark.renew(from: folder)
+    }
+
+    private func cloudFileStatusLine(prefix: String, url: URL) -> String {
+        (url as NSURL).removeAllCachedResourceValues()
+        let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let mtime = attrs?[.modificationDate] as? Date
+        let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+        var parts: [String] = ["\(prefix): \(url.lastPathComponent)"]
+        if let d = mtime {
+            let f = DateFormatter()
+            f.locale = Locale(identifier: "it_IT")
+            f.timeZone = .current
+            f.dateFormat = "dd/MM/yyyy HH:mm:ss"
+            parts.append("aggiornato: \(f.string(from: d))")
+        }
+        if size > 0 {
+            let fmt = ByteCountFormatter()
+            fmt.allowedUnits = [.useKB, .useMB]
+            fmt.countStyle = .file
+            parts.append(fmt.string(fromByteCount: size))
+        }
+        return parts.joined(separator: " — ")
+    }
+
+    /// Scarta la copia File Provider dell’ultimo accesso e riscarica `*_light.enc` da Dropbox.
+    private func alignLightFileFromCloud() async {
+        guard let folder = dataFolderURL else { return }
+        guard !isBusy, !isAligningCloud else { return }
+        isAligningCloud = true
+        message = "Richiesta copia aggiornata a Dropbox…"
+        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let folderURL = folder
+        let result: String = await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let access = folderURL.startAccessingSecurityScopedResource()
+                defer {
+                    if access {
+                        folderURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+                guard access else {
+                    continuation.resume(
+                        returning: "Impossibile accedere alla cartella (permessi). Usa «Cambia cartella…» e riselezionala."
+                    )
+                    return
+                }
+                continuation.resume(
+                    returning: ContiDatabase.realignLightEncFilesFromCloud(in: folderURL, email: emailTrim)
+                )
+            }
+        }
+        refreshKeyStatus()
+        message = result
+        isAligningCloud = false
     }
 
     /// Categorie distinte (testo mostrato in lista), ordinate.
@@ -652,7 +726,7 @@ struct ContentView: View {
         }
         .listStyle(.insetGrouped)
         .refreshable {
-            await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+            await refreshLightSessionIfLoggedIn(forceReResolveEnc: true, forceCloudRedownload: true)
         }
         .navigationTitle("Movimenti")
         .navigationBarTitleDisplayMode(.inline)
@@ -695,7 +769,7 @@ struct ContentView: View {
                 .accessibilityLabel("Saldi")
                 Button {
                     Task { @MainActor in
-                        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true)
+                        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true, forceCloudRedownload: true)
                     }
                 } label: {
                     if isRefreshingSession {
@@ -877,7 +951,8 @@ struct ContentView: View {
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
                 folderURL: folderURL,
-                lightEncURLIfKnown: nil
+                lightEncURLIfKnown: nil,
+                forceCloudRedownload: true
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
         }
@@ -909,7 +984,8 @@ struct ContentView: View {
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
                 folderURL: folder,
-                lightEncURLIfKnown: nil
+                lightEncURLIfKnown: nil,
+                forceCloudRedownload: true
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
         }
@@ -917,7 +993,8 @@ struct ContentView: View {
 
     /// Ricarica silenziosamente il file light dalla cartella (stesso compito del tasto Aggiorna quando `forceReResolveEnc` è attivo).
     /// Default: risolve di nuovo il path `*_light.enc` (Importo allineato al file su disco dopo sync Dropbox / Files).
-    private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = true) async {
+    /// `forceCloudRedownload`: scarta la copia File Provider e riscarica (Aggiorna / pull); non usarlo a ogni ritorno in primo piano.
+    private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = true, forceCloudRedownload: Bool = false) async {
         guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -940,7 +1017,8 @@ struct ContentView: View {
             passwordTrim: passwordTrim,
             folderURL: folder,
             lightEncURLIfKnown: encRef,
-            skipSessionWorkspaceLock: true
+            skipSessionWorkspaceLock: true,
+            forceCloudRedownload: forceCloudRedownload
         )
         guard let newDb = packet.sessionDb,
               packet.keyURL != nil,
@@ -994,7 +1072,8 @@ struct ContentView: View {
         passwordTrim: String,
         folderURL: URL,
         lightEncURLIfKnown: URL?,
-        skipSessionWorkspaceLock: Bool = false
+        skipSessionWorkspaceLock: Bool = false,
+        forceCloudRedownload: Bool = false
     ) async -> LoginResultPacket {
         await withCheckedContinuation { (cont: CheckedContinuation<LoginResultPacket, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -1072,15 +1151,36 @@ struct ContentView: View {
                     return
                 }
                 let fullEncURL = ContiDatabase.perUserEncURL(primaryEnc: encRef, email: emailTrim)
+                let cloudWait = ContiDatabase.requestFreshCloudMaterialization(
+                    of: encRef,
+                    forceEvict: forceCloudRedownload
+                )
+                let lightSize = (try? FileManager.default.attributesOfItem(atPath: encRef.path)[.size] as? NSNumber)?.int64Value ?? 0
+                if forceCloudRedownload, lightSize <= 0 {
+                    packet = LoginResultPacket(
+                        message: """
+                        Non riesco a scaricare il file light aggiornato da Dropbox (la copia sul telefono era probabilmente quella dell’ultima apertura). \
+                        Apri l’app Dropbox, attendi che \(encRef.lastPathComponent) sia in linea, poi in Conti Light tocca «Allinea file con Dropbox» e Accedi. \
+                        Se Dropbox è già aggiornato, usa «Cambia cartella…» e riseleziona la stessa cartella.
+                        """,
+                        records: [],
+                        sessionDb: nil,
+                        keyURL: nil,
+                        lightEncURL: nil,
+                        periodicStartupMessage: nil
+                    )
+                    cont.resume(returning: packet)
+                    return
+                }
                 var dropboxWaitPaths: [URL] = [keyRef, encRef]
                 if FileManager.default.fileExists(atPath: fullEncURL.path) {
                     dropboxWaitPaths.append(fullEncURL)
                 }
                 let waited = ContiDatabase.waitForPathsStableIfDropbox(dropboxWaitPaths)
-                // Su iOS/Dropbox Files la prima «stabilità» può essere un file ancora non aggiornato dal cloud; breve pausa + seconda passata sull’`.enc`.
+                // Dopo evict/download: breve pausa + seconda stabilità sull’`.enc` (il provider può finire di scrivere dopo «current»).
                 Thread.sleep(forTimeInterval: 0.45)
                 let waited2 = ContiDatabase.waitForFileStableIfDropbox(encRef)
-                let totalWait = waited + waited2
+                let totalWait = cloudWait + waited + waited2
                 let syncWaitNote: String = totalWait >= 1.0
                     ? String(format: "Attesa sincronizzazione Dropbox: %.1fs.", totalWait)
                     : ""
