@@ -695,6 +695,76 @@ def virtuale_apply_discharge(residual: Decimal, item: Decimal) -> Decimal:
     return Decimal("0.00")
 
 
+def virtuale_correct_closing_item(residual: Decimal, item: Decimal) -> Decimal:
+    """Se l'importo chiude il residuo ma ha il segno sbagliato, lo inverte.
+
+    Tipico dello scarico finale di un rimborso (residuo negativo): lo stesso modulo
+    con segno negativo raddoppierebbe il residuo invece di azzerarlo.
+    """
+    r = residual.quantize(Decimal("0.01"))
+    a = item.quantize(Decimal("0.01"))
+    if r == 0 or a == 0:
+        return a
+    if abs(a) != abs(r):
+        return a
+    if virtuale_apply_discharge(r, a) == 0:
+        return a
+    flipped = (-a).quantize(Decimal("0.01"))
+    if virtuale_apply_discharge(r, flipped) == 0:
+        return flipped
+    return a
+
+
+def virtuale_commit_discharge_item(residual: Decimal, item: Decimal) -> tuple[Decimal, Decimal]:
+    """Importo da registrare e residuo dopo lo scarico (con inversione dello scarico finale se serve)."""
+    saved = virtuale_correct_closing_item(residual, item)
+    return saved, virtuale_apply_discharge(residual, saved)
+
+
+def virtuale_nonzero_startup_message(residual: Decimal) -> str:
+    """Testo dell'avviso all'apertura se il saldo virtuale non è zero (anche negativo)."""
+    m = residual.quantize(Decimal("0.01"))
+    lines = [
+        f"Il saldo virtuale è di {format_euro_it(m)} €.",
+        "",
+        "La sessione precedente si è interrotta prima dell'azzeramento.",
+        "Occorre completare lo scarico del saldo virtuale.",
+    ]
+    if m < 0:
+        lines.extend(
+            [
+                "",
+                "Il residuo è negativo (rimborso da splittare):",
+                "lo scarico finale deve avere segno positivo per azzerarlo.",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "In alternativa, usa «Azzera saldo virtuale (emergenza)» nelle Opzioni.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def virtuale_replace_discharge_item(residual: Decimal, old_item: Decimal, new_item: Decimal) -> Decimal:
+    """Sostituisce una voce di scarico già applicata (``new_item`` a zero = annullo)."""
+    r = residual.quantize(Decimal("0.01"))
+    old_a = old_item.quantize(Decimal("0.01"))
+    new_a = new_item.quantize(Decimal("0.01"))
+    if r == 0:
+        return Decimal("0.00")
+    if r > 0:
+        before = (r + abs(old_a)).quantize(Decimal("0.01"))
+        if new_a == 0:
+            return before
+        return virtuale_apply_discharge(before, new_a)
+    before = (r - old_a).quantize(Decimal("0.01"))
+    if new_a == 0:
+        return before
+    return virtuale_apply_discharge(before, new_a)
+
+
 def bind_entry_first_char_uppercase(var: tk.StringVar, entry: tk.Misc) -> None:
     """Il primo carattere del testo viene forzato in maiuscolo se immesso minuscolo."""
     lock: list[bool] = [False]
@@ -773,6 +843,18 @@ def _euro_text_with_leading_sign(text: str, sign: str) -> str:
     return sig + _euro_strip_leading_signs(text or "")
 
 
+def apply_ttk_entry_display_font(entry: tk.Misc, font: tuple | str) -> None:
+    """Font del testo in caselle ``Entry``.
+
+    Su macOS e Windows il tema ttk (Sun Valley) spesso ignora ``TEntry.font``:
+    Data, Assegno e Nota restano più piccoli delle etichette e delle combobox vicine.
+    """
+    try:
+        entry.configure(font=font)
+    except tk.TclError:
+        pass
+
+
 def _euro_amount_entry(
     parent: tk.Misc,
     textvariable: tk.StringVar,
@@ -788,7 +870,11 @@ def _euro_amount_entry(
         if font is not None:
             kw["font"] = font
         return tk.Entry(parent, textvariable=textvariable, **kw)
-    return ttk.Entry(parent, textvariable=textvariable, width=width, style=style, **kwargs)
+    ttk_kw: dict[str, object] = dict(kwargs)
+    ent = ttk.Entry(parent, textvariable=textvariable, width=width, style=style, **ttk_kw)
+    if font is not None:
+        apply_ttk_entry_display_font(ent, font)
+    return ent
 
 
 def bind_euro_amount_entry_validation(
@@ -12714,7 +12800,10 @@ def build_ui(
             except Exception as exc:
                 messagebox.showerror("Importo", str(exc), parent=top)
                 return
+            old_amt = to_decimal(rec.get("amount_eur") or "0")
             apply_amount_to_record(rec, amt)
+            if rec.get("is_virtuale_discharge"):
+                _apply_virtuale_discharge_item_change(old_amt, amt)
             top.destroy()
             persist_db_after_edit(stable_key, ensure_reselected_visible=True)
 
@@ -13111,7 +13200,11 @@ th {{ background:#efefef; text-align:left; }}
         )
         if not ask:
             return
+        old_amt = to_decimal(rec.get("amount_eur") or "0")
+        was_discharge = bool(rec.get("is_virtuale_discharge"))
         rec["is_cancelled"] = True
+        if was_discharge:
+            _apply_virtuale_discharge_item_change(old_amt, Decimal("0"))
         persist_db_after_edit(None)
         if reg_n is not None:
             messagebox.showinfo("Registrazione eliminata", f"Registrazione {reg_n} annullata.")
@@ -16560,6 +16653,7 @@ th {{ background:#efefef; text-align:left; }}
     )
     row_date = tk.Frame(nuova_form_head, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     ent_date = ttk.Entry(row_date, textvariable=newreg_date_var, width=_NR_W_DATE, style="NewReg.TEntry")
+    apply_ttk_entry_display_font(ent_date, newreg_ui_font)
     ent_date.pack(side=tk.LEFT)
     btn_oggi = tk.Label(
         row_date,
@@ -16677,7 +16771,13 @@ th {{ background:#efefef; text-align:left; }}
     lbl_virtuale_nota.pack(anchor=tk.W)
     frm_virtuale_detail = tk.Frame(frm_virtuale_info, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
     tk.Label(frm_virtuale_detail, text="Saldo virtuale (€)", **_newreg_plain_lbl_kw).pack(side=tk.LEFT, padx=(0, 6))
-    ent_virtuale_saldo = ttk.Entry(frm_virtuale_detail, textvariable=virtuale_display_var, width=_NR_W_AMT, style="NewReg.TEntry")
+    ent_virtuale_saldo = ttk.Entry(
+        frm_virtuale_detail,
+        textvariable=virtuale_display_var,
+        width=_NR_W_AMT,
+        style="NewReg.TEntry",
+    )
+    apply_ttk_entry_display_font(ent_virtuale_saldo, newreg_ui_font)
     ent_virtuale_saldo.pack(side=tk.LEFT, padx=(0, 8))
     btn_scarica_virtuale = ttk.Button(frm_virtuale_detail, text="Scarica saldo virtuale", style="NewReg.TButton")
     btn_scarica_virtuale.pack(side=tk.LEFT)
@@ -16705,10 +16805,12 @@ th {{ background:#efefef; text-align:left; }}
     lbl_assegno = tk.Label(nuova_form, text="Assegno", **_newreg_plain_lbl_kw)
     lbl_assegno.grid(row=4, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_chq = ttk.Entry(nuova_form, textvariable=newreg_cheque_var, width=_NR_W_CHQ, style="NewReg.TEntry")
+    apply_ttk_entry_display_font(ent_chq, newreg_ui_font)
     ent_chq.grid(row=4, column=1, sticky="w", pady=_newreg_py)
     bind_limited_single_line_text_entry(ent_chq, newreg_cheque_var, max_len=MAX_CHEQUE_LEN, strip_edges=False)
     tk.Label(nuova_form, text="Nota", **_newreg_plain_lbl_kw).grid(row=5, column=0, sticky="w", pady=_newreg_py, padx=(0, _newreg_px))
     ent_note = ttk.Entry(nuova_form, textvariable=newreg_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
+    apply_ttk_entry_display_font(ent_note, newreg_ui_font)
     ent_note.grid(row=5, column=1, sticky="w", pady=_newreg_py)
     bind_limited_single_line_text_entry(ent_note, newreg_note_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
     bind_entry_first_char_uppercase(newreg_note_var, ent_note)
@@ -17331,6 +17433,27 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
+    def _sync_newreg_amount_entry_from_var() -> None:
+        sync = getattr(ent_amt, "_cdc_euro_sync_from_var", None)
+        if callable(sync):
+            sync()
+        else:
+            _sync_tk_entry_from_stringvar(ent_amt, newreg_amount_var)
+
+    def _apply_virtuale_discharge_item_change(old_item: Decimal, new_item: Decimal) -> None:
+        """Allinea il residuo sidecar a una modifica/annullo di registrazione di scarico."""
+        if virtuale_saldo[0] == 0 and not virtuale_discharge_active[0]:
+            return
+        nxt = virtuale_replace_discharge_item(virtuale_saldo[0], old_item, new_item)
+        virtuale_saldo[0] = nxt
+        write_virtuale_saldo(nxt)
+        if nxt == 0:
+            if virtuale_discharge_active[0]:
+                _exit_virtuale_discharge_mode()
+            return
+        virtuale_discharge_active[0] = True
+        _refresh_virtuale_ui()
+
     def _on_scarica_virtuale_click() -> None:
         m = virtuale_saldo[0].quantize(Decimal("0.01"))
         if m == 0:
@@ -17338,6 +17461,7 @@ th {{ background:#efefef; text-align:left; }}
         need = (-m).quantize(Decimal("0.01"))
         newreg_sign_var.set("-" if need < 0 else "+")
         newreg_amount_var.set(("-" if need < 0 else "+") + format_euro_it(abs(need)))
+        _sync_newreg_amount_entry_from_var()
 
     def _giro_combo_pair_lists() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         """Per Girata conto/conto: coppie nome/codice (stesso elenco per primo e secondo conto)."""
@@ -17376,9 +17500,20 @@ th {{ background:#efefef; text-align:left; }}
             newreg_cat_code_var.set(code)
         newreg_cat_note_var.set(cat_note_by_code_cache.get(code, "-") or "-")
         is_giro = _is_giro_label(newreg_cat_var.get())
+        apply_cat_sign = True
+        if virtuale_discharge_active[0] and not is_giro:
+            try:
+                raw_cur = (newreg_amount_var.get() or "").strip()
+                if raw_cur and raw_cur not in ("+", "-"):
+                    cur_amt = normalize_euro_input(raw_cur).quantize(Decimal("0.01"))
+                    rem = virtuale_saldo[0].quantize(Decimal("0.01"))
+                    if rem != 0 and abs(cur_amt) == abs(rem):
+                        apply_cat_sign = False
+            except Exception:
+                apply_cat_sign = True
         if is_giro:
             _apply_sign("-")
-        else:
+        elif apply_cat_sign:
             sign = cat_sign_by_code_cache.get(code, "")
             if sign == "+":
                 _apply_sign("+")
@@ -17790,6 +17925,13 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 pass
             return None
+        if virtuale_discharge_active[0]:
+            amt_corr = virtuale_correct_closing_item(virtuale_saldo[0], amt)
+            if amt_corr != amt:
+                amt = amt_corr
+                newreg_sign_var.set("-" if amt < 0 else "+")
+                newreg_amount_var.set(("-" if amt < 0 else "+") + format_euro_it(abs(amt)))
+                _sync_newreg_amount_entry_from_var()
         if _is_cassa_first_account():
             chq = "-"
         elif _is_primary_account_credit_card():
@@ -17858,6 +18000,13 @@ th {{ background:#efefef; text-align:left; }}
             return False
         if not messagebox.askyesno(dialog_title, f"Confermi l'inserimento della registrazione?\n\n{preview}"):
             return False
+        discharge_after: Decimal | None = None
+        if rec.get("is_virtuale_discharge") and virtuale_discharge_active[0]:
+            saved_amt, discharge_after = virtuale_commit_discharge_item(
+                virtuale_saldo[0], to_decimal(rec.get("amount_eur") or "0")
+            )
+            rec["amount_eur"] = format_money(saved_amt)
+            rec["display_amount"] = format_money(saved_amt)
         y_bucket = _ensure_year_bucket(int(rec["year"]))
         y_bucket["records"].append(rec)
         try:
@@ -17877,6 +18026,13 @@ th {{ background:#efefef; text-align:left; }}
             virt_dst = _is_virtuale_account(str(rec.get("account_secondary_name", "")))
             if virt_src ^ virt_dst:
                 _enter_virtuale_discharge_mode(amt_dec, refund=virt_src)
+        elif discharge_after is not None:
+            virtuale_saldo[0] = discharge_after
+            write_virtuale_saldo(discharge_after)
+            if discharge_after == Decimal("0"):
+                _exit_virtuale_discharge_mode()
+            else:
+                _refresh_virtuale_ui()
         elif virtuale_discharge_active[0]:
             virtuale_saldo[0] = virtuale_apply_discharge(virtuale_saldo[0], amt_dec)
             write_virtuale_saldo(virtuale_saldo[0])
@@ -17894,7 +18050,8 @@ th {{ background:#efefef; text-align:left; }}
         return True
 
     def _commit_new_record(*, finish: bool) -> None:
-        if finish and virtuale_discharge_active[0]:
+        if finish and _virtuale_must_discharge():
+            virtuale_discharge_active[0] = True
             messagebox.showwarning(
                 "Saldo virtuale",
                 f"Il saldo virtuale è di {format_euro_it(virtuale_saldo[0])} €.\n"
@@ -18370,7 +18527,13 @@ th {{ background:#efefef; text-align:left; }}
         row=0, column=0, sticky="w", pady=_per_py, padx=(0, _per_px)
     )
     row_per_start = tk.Frame(per_form, bg=MOVIMENTI_PAGE_BG, highlightthickness=0)
-    ent_per_start = ttk.Entry(row_per_start, textvariable=per_start_date_var, width=_NR_W_DATE, style="NewReg.TEntry")
+    ent_per_start = ttk.Entry(
+        row_per_start,
+        textvariable=per_start_date_var,
+        width=_NR_W_DATE,
+        style="NewReg.TEntry",
+    )
+    apply_ttk_entry_display_font(ent_per_start, newreg_ui_font)
     ent_per_start.pack(side=tk.LEFT)
     btn_per_oggi = tk.Label(
         row_per_start,
@@ -18603,6 +18766,7 @@ th {{ background:#efefef; text-align:left; }}
     row_per_amt.grid(row=6, column=1, sticky="w", pady=_per_py)
     tk.Label(per_form, text="Nota", **_newreg_plain_lbl_kw).grid(row=7, column=0, sticky="w", pady=_per_py, padx=(0, _per_px))
     ent_per_note = ttk.Entry(per_form, textvariable=per_note_var, width=_NR_W_NOTE, style="NewReg.TEntry")
+    apply_ttk_entry_display_font(ent_per_note, newreg_ui_font)
     ent_per_note.grid(row=7, column=1, columnspan=3, sticky="w", pady=_per_py)
     bind_limited_single_line_text_entry(ent_per_note, per_note_var, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
     bind_entry_first_char_uppercase(per_note_var, ent_per_note)
@@ -19294,7 +19458,8 @@ th {{ background:#efefef; text-align:left; }}
             ttk.Label(frm, text=_rule_title_text()).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
             cur_due = periodiche.next_due_date(rule)
             v = tk.StringVar(value=to_italian_date((cur_due or date.today()).isoformat()))
-            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_DATE)
+            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_DATE, style="NewReg.TEntry")
+            apply_ttk_entry_display_font(ent, newreg_ui_font)
             ttk.Label(frm, text="Prossima scadenza").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
             ent.grid(row=1, column=1, sticky="w", pady=4)
 
@@ -19496,7 +19661,7 @@ th {{ background:#efefef; text-align:left; }}
             except Exception:
                 amt_dec = Decimal("0")
             v = tk.StringVar(value=("-" if amt_dec < 0 else "+") + format_euro_it(abs(amt_dec)))
-            ent = _euro_amount_entry(frm, v, width=_NR_W_AMT)
+            ent = _euro_amount_entry(frm, v, width=_NR_W_AMT, font=newreg_ui_font, style="NewReg.TEntry")
             ttk.Label(frm, text="Importo (€)").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
             ent.grid(row=1, column=1, sticky="w", pady=4)
             bind_euro_amount_entry_validation(
@@ -19548,7 +19713,8 @@ th {{ background:#efefef; text-align:left; }}
             tpl = rule.get("template") or {}
             current = "" if str(tpl.get("note") or "") == "-" else str(tpl.get("note") or "")
             v = tk.StringVar(value=current)
-            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_NOTE)
+            ent = ttk.Entry(frm, textvariable=v, width=_NR_W_NOTE, style="NewReg.TEntry")
+            apply_ttk_entry_display_font(ent, newreg_ui_font)
             ttk.Label(frm, text="Nota").grid(row=1, column=0, sticky="w", padx=(0, 8), pady=4)
             ent.grid(row=1, column=1, sticky="w", pady=4)
             bind_limited_single_line_text_entry(ent, v, max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
@@ -20249,6 +20415,8 @@ th {{ background:#efefef; text-align:left; }}
             opzioni_ix = notebook.index(opzioni_frame)
         except Exception:
             opzioni_ix = -1
+        if _virtuale_must_discharge():
+            virtuale_discharge_active[0] = True
         if virtuale_discharge_active[0] and cur != nuovi_ix and cur != opzioni_ix:
             messagebox.showwarning(
                 "Saldo virtuale",
@@ -33362,6 +33530,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     plan_acc_scroll_wrap.pack(fill=tk.BOTH, expand=True)
 
     def _try_open_plan_conti_pending() -> None:
+        if _virtuale_must_discharge() or virtuale_discharge_active[0]:
+            return
         security_auth.ensure_security(cur_db())
         up = cur_db().get("user_profile") or {}
         if not up.get("plan_conti_wizard_pending"):
@@ -35604,7 +35774,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             )
 
     def _open_opzioni_if_mail_incomplete() -> None:
-        if virtuale_discharge_active[0]:
+        if _virtuale_must_discharge() or virtuale_discharge_active[0]:
             return
         try:
             if not email_client.is_app_mail_configured(cur_db()):
@@ -35613,8 +35783,15 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             pass
 
     def _startup_check_virtuale_pending() -> None:
-        if not virtuale_discharge_active[0]:
+        m = virtuale_saldo[0].quantize(Decimal("0.01"))
+        if m == Decimal("0.00"):
+            virtuale_discharge_active[0] = False
             return
+        virtuale_discharge_active[0] = True
+        try:
+            _refresh_virtuale_ui()
+        except Exception:
+            pass
         try:
             notebook.select(nuovi_dati_frame)
         except Exception:
@@ -35623,12 +35800,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             _show_mode("new")
         except Exception:
             pass
+        try:
+            _sync_cat_note_and_second_account()
+        except Exception:
+            pass
         messagebox.showwarning(
             "Saldo virtuale non azzerato",
-            f"Il saldo virtuale è di {format_euro_it(virtuale_saldo[0])} €.\n\n"
-            "La sessione precedente si è interrotta prima dell'azzeramento.\n"
-            "Occorre completare lo scarico del saldo virtuale.\n\n"
-            "In alternativa, usa «Azzera saldo virtuale (emergenza)» nelle Opzioni.",
+            virtuale_nonzero_startup_message(m),
+            parent=root,
         )
 
     def _startup_periodic_then_virtuale() -> None:
