@@ -646,7 +646,7 @@ def bind_return_tab_and_kp_enter(widget: tk.Misc, callback: Callable[..., object
 
 
 def read_virtuale_saldo() -> Decimal:
-    """Saldo virtuale residuo da scaricare (persistente tra sessioni)."""
+    """Saldo virtuale residuo da scaricare (persistente tra sessioni; può essere negativo per i rimborsi)."""
     try:
         if DEFAULT_VIRTUALE_SALDO_FILE.exists():
             return Decimal(str(json.loads(DEFAULT_VIRTUALE_SALDO_FILE.read_text(encoding="utf-8")).get("euro", "0")))
@@ -659,13 +659,40 @@ def write_virtuale_saldo(value: Decimal) -> None:
     try:
         DEFAULT_VIRTUALE_SALDO_FILE.parent.mkdir(parents=True, exist_ok=True)
         v = value.quantize(Decimal("0.01"))
-        if v <= 0:
+        if v == 0:
             if DEFAULT_VIRTUALE_SALDO_FILE.exists():
                 DEFAULT_VIRTUALE_SALDO_FILE.unlink()
         else:
             DEFAULT_VIRTUALE_SALDO_FILE.write_text(json.dumps({"euro": str(v)}), encoding="utf-8")
     except Exception:
         pass
+
+
+def virtuale_opening_residual(amount: Decimal, *, virtuale_is_source: bool) -> Decimal:
+    """Residuo dopo la girata di apertura: verso VIRTUALE = spesa (valore assoluto); da VIRTUALE = rimborso (segno conservato)."""
+    q = amount.quantize(Decimal("0.01"))
+    if virtuale_is_source:
+        return q
+    return abs(q)
+
+
+def virtuale_apply_discharge(residual: Decimal, item: Decimal) -> Decimal:
+    """Aggiorna il residuo con una voce di scarico.
+
+    Spesa (residuo > 0): ogni voce riduce il residuo di ``abs(item)`` (non sotto zero).
+    Rimborso (residuo < 0): ``item`` positivo avvicina a zero, ``item`` negativo allontana
+    (non si oltrepassa lo zero verso il positivo).
+    """
+    r = residual.quantize(Decimal("0.01"))
+    a = item.quantize(Decimal("0.01"))
+    if r > 0:
+        return max(Decimal("0.00"), (r - abs(a)).quantize(Decimal("0.01")))
+    if r < 0:
+        nb = (r + a).quantize(Decimal("0.01"))
+        if nb > 0:
+            return Decimal("0.00")
+        return nb
+    return Decimal("0.00")
 
 
 def bind_entry_first_char_uppercase(var: tk.StringVar, entry: tk.Misc) -> None:
@@ -16336,7 +16363,7 @@ th {{ background:#efefef; text-align:left; }}
     saldo_aggiorna_locked: list[bool] = [False]
     # --- Saldo Virtuale (sostituisce la vecchia Memoria di cassa) ---
     virtuale_saldo: list[Decimal] = [read_virtuale_saldo()]
-    virtuale_discharge_active: list[bool] = [read_virtuale_saldo() > Decimal("0")]
+    virtuale_discharge_active: list[bool] = [read_virtuale_saldo() != Decimal("0")]
     virtuale_display_var = tk.StringVar(value="")
     newreg_calendar_popup: list[tk.Toplevel | None] = [None]
     newreg_date_manual_mode: list[bool] = [False]
@@ -17262,21 +17289,32 @@ th {{ background:#efefef; text-align:left; }}
             newreg_note_var.set("Giroconto")
 
     def _virtuale_must_discharge() -> bool:
-        return virtuale_saldo[0] > Decimal("0")
+        return virtuale_saldo[0] != Decimal("0")
 
     def _refresh_virtuale_ui() -> None:
         m = virtuale_saldo[0].quantize(Decimal("0.01"))
-        virtuale_display_var.set(format_euro_it(m) if m > 0 else "")
-        if virtuale_discharge_active[0] and m > 0:
-            lbl_virtuale_nota.configure(
-                text=f"Saldo virtuale: {format_euro_it(m)} €. Registra per ridurre o scarica."
-            )
+        if m == 0:
+            virtuale_display_var.set("")
+        else:
+            virtuale_display_var.set(format_euro_it(m))
+        if virtuale_discharge_active[0] and m != 0:
+            if m < 0:
+                lbl_virtuale_nota.configure(
+                    text=(
+                        f"Saldo virtuale: {format_euro_it(m)} € (rimborso da splittare). "
+                        "Le voci positive lo riducono; le voci negative lo aumentano."
+                    )
+                )
+            else:
+                lbl_virtuale_nota.configure(
+                    text=f"Saldo virtuale: {format_euro_it(m)} €. Registra per ridurre o scarica."
+                )
             frm_virtuale_info.grid(row=2, column=0, columnspan=3, sticky="w", pady=_newreg_py)
         else:
             frm_virtuale_info.grid_remove()
 
-    def _enter_virtuale_discharge_mode(amount: Decimal) -> None:
-        virtuale_saldo[0] = abs(amount).quantize(Decimal("0.01"))
+    def _enter_virtuale_discharge_mode(amount: Decimal, *, refund: bool) -> None:
+        virtuale_saldo[0] = virtuale_opening_residual(amount, virtuale_is_source=refund)
         virtuale_discharge_active[0] = True
         write_virtuale_saldo(virtuale_saldo[0])
         _refresh_virtuale_ui()
@@ -17294,17 +17332,12 @@ th {{ background:#efefef; text-align:left; }}
             pass
 
     def _on_scarica_virtuale_click() -> None:
-        m = virtuale_saldo[0]
-        if m <= 0:
+        m = virtuale_saldo[0].quantize(Decimal("0.01"))
+        if m == 0:
             return
-        code = newreg_cat_code_var.get().strip()
-        if not code:
-            code = next((c for n, c in cat_opts_cache if n == newreg_cat_var.get()), "")
-        sign = cat_sign_by_code_cache.get(code, "-")
-        if sign not in ("+", "-"):
-            sign = "-"
-        newreg_sign_var.set(sign)
-        newreg_amount_var.set(("-" if sign == "-" else "+") + format_euro_it(m))
+        need = (-m).quantize(Decimal("0.01"))
+        newreg_sign_var.set("-" if need < 0 else "+")
+        newreg_amount_var.set(("-" if need < 0 else "+") + format_euro_it(abs(need)))
 
     def _giro_combo_pair_lists() -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
         """Per Girata conto/conto: coppie nome/codice (stesso elenco per primo e secondo conto)."""
@@ -17840,12 +17873,14 @@ th {{ background:#efefef; text-align:left; }}
         has_virtuale = (_is_virtuale_account(str(rec.get("account_primary_name", "")))
                         or _is_virtuale_account(str(rec.get("account_secondary_name", ""))))
         if has_virtuale and is_giroconto_record(rec) and not virtuale_discharge_active[0]:
-            _enter_virtuale_discharge_mode(amt_dec)
+            virt_src = _is_virtuale_account(str(rec.get("account_primary_name", "")))
+            virt_dst = _is_virtuale_account(str(rec.get("account_secondary_name", "")))
+            if virt_src ^ virt_dst:
+                _enter_virtuale_discharge_mode(amt_dec, refund=virt_src)
         elif virtuale_discharge_active[0]:
-            new_bal = (virtuale_saldo[0] - abs(amt_dec)).quantize(Decimal("0.01"))
-            virtuale_saldo[0] = max(Decimal("0"), new_bal)
+            virtuale_saldo[0] = virtuale_apply_discharge(virtuale_saldo[0], amt_dec)
             write_virtuale_saldo(virtuale_saldo[0])
-            if virtuale_saldo[0] <= Decimal("0"):
+            if virtuale_saldo[0] == Decimal("0"):
                 _exit_virtuale_discharge_mode()
             else:
                 _refresh_virtuale_ui()
@@ -35072,8 +35107,8 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
     ttk.Label(
         opzioni_inner,
         text=(
-            "Funzioni presenti ma non attivabili da questa pagina: import legacy, azzeramento di emergenza del saldo "
-            "virtuale, verifica coerenza file cifrati e copia manuale Dropbox verso Library."
+            "Funzioni presenti ma non attivabili da questa pagina: import legacy, "
+            "verifica coerenza file cifrati e copia manuale Dropbox verso Library."
         ),
         wraplength=980,
         foreground="#555555",
@@ -35301,7 +35336,7 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
 
     # --- Azzeramento di emergenza saldo virtuale ---
     def _emergency_reset_virtuale() -> None:
-        if virtuale_saldo[0] <= Decimal("0") and not virtuale_discharge_active[0]:
+        if virtuale_saldo[0] == Decimal("0") and not virtuale_discharge_active[0]:
             messagebox.showinfo("Saldo virtuale", "Non c'è nessun saldo virtuale da azzerare.")
             return
         if not messagebox.askyesno(
@@ -35321,6 +35356,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
         _exit_virtuale_discharge_mode()
         _populate_form_defaults(keep_last=False)
         messagebox.showinfo("Saldo virtuale", "Saldo virtuale azzerato.")
+
+    _opz_action_label(
+        data_restore_row,
+        "Azzera saldo virtuale (emergenza)",
+        _emergency_reset_virtuale,
+        color=_OPZ_RED,
+        active_color=_OPZ_RED_ACTIVE,
+    ).pack(side=tk.LEFT, padx=(12, 0))
 
     # --- Diagnostica e recovery file cifrati ---
     def _enc_file_info(p: Path) -> str | None:

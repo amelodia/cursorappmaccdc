@@ -28,7 +28,7 @@ La pagina ha due sotto-schede: «Nuova registrazione» (singola immissione) e «
 Immissione di nuove registrazioni contabili: compila data, categorie, conti, importo, nota e eventuale assegno secondo le regole del tipo di operazione.
 • Girata conto/conto: per una girata con secondo conto Cassa, il campo Nota può essere preimpostato con «Aut », la data breve e uno spazio finale, per agevolare la digitazione, salvo quando il primo conto è Cassa o un conto carta di credito (in quel caso si usa il modello «Giroconto» come negli altri casi); al focus, se il testo è quello modello «Aut gg/mm», il cursore si posiziona dopo lo spazio finale. Per giroconti verso/da VIRTUALE la nota non viene preimpostata a «Giroconto».
 • Dopo ogni inserimento andato a buon fine restano preimpostati data, categoria e conto dell’ultima registrazione mentre resti sulla pagina di immissione; uscendo dalla scheda «Nuove registrazioni» i default tornano allo stato iniziale (es. oggi, Consumi ordinari, Cassa). Cambiando pagina dalla barra in alto con importo compilato viene richiesta conferma d’inserimento come per «Conferma immissione» prima di uscire.
-• Conto VIRTUALE: compare nel menu conti solo se la categoria è «Girata conto/conto», in ultima posizione. Non si possono impostare entrambi i conti della girata su VIRTUALE: in quel caso l’altro conto torna a Cassa. In «fase scarico» resti sulla pagina di immissione finché il saldo virtuale non torna a zero; le categorie ammesse escludono la Girata; il conto è solo VIRTUALE; le registrazioni di scarico non alterano i saldi reali ma compaiono nei Movimenti e nelle analisi per categoria.
+• Conto VIRTUALE: compare nel menu conti solo se la categoria è «Girata conto/conto», in ultima posizione. Non si possono impostare entrambi i conti della girata su VIRTUALE: in quel caso l’altro conto torna a Cassa. In «fase scarico» resti sulla pagina di immissione finché il saldo virtuale non torna a zero; le categorie ammesse escludono la Girata; il conto è solo VIRTUALE; le registrazioni di scarico non alterano i saldi reali ma compaiono nei Movimenti e nelle analisi per categoria. Se la girata parte da VIRTUALE (importo in genere negativo: rimborso da splittare), il residuo è negativo: le voci positive lo riducono, quelle negative lo aumentano. In emergenza, Opzioni → «Azzera saldo virtuale (emergenza)».
 • Memoria virtuale: la prima girata con VIRTUALE incide sul conto non virtuale coinvolto; le successive in fase scarico aggiornano solo il saldo virtuale e le categorie.
 
 SCHEDA «VERIFICA»
@@ -45,7 +45,7 @@ SCHEDA «STATISTICHE» E «BUDGET»
 SCHEDA «OPZIONI»
 • Collegamenti per aprire le schede Categorie e Conti (il piano conti compare come schede aggiuntive nella barra in alto solo quando attivato da qui o dal flusso previsto).
 • Posta e sicurezza: configurazione SMTP/IMAP, verifica, notifiche amministrative, ripetizione primo accesso o reset (operazioni irreversibili: leggi sempre i messaggi di conferma).
-• Percorsi del file dati cifrato e della chiave, backup, ripristino, import legacy da cartelle predefinite o personalizzate.
+• Percorsi del file dati cifrato e della chiave, backup, ripristino, import legacy da cartelle predefinite o personalizzate. «Azzera saldo virtuale (emergenza)» sblocca la fase scarico senza modificare le registrazioni già inserite.
 • Altre preferenze utente (intestazioni stampa, cartelle e modello nome per estratti PDF e rapporto fine verifica, ecc.) secondo quanto mostrato nella pagina.
 
 SCHEDE «CATEGORIE» E «CONTI»
