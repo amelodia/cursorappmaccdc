@@ -18242,15 +18242,39 @@ th {{ background:#efefef; text-align:left; }}
     tk.Label(per_mov_hdr, text="Ultima creaz.", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(
         row=0, column=2, sticky="ew"
     )
-    tk.Label(per_mov_hdr, text="Prossima creaz.", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(
-        row=0, column=3, sticky="ew"
+    _PER_SORT_HDR = {"next": "Prossima creaz.", "cat": "Categoria", "acc1": "Conto"}
+    per_tree_sort: list[str] = ["next"]
+    per_tree_sort_reverse: list[bool] = [False]
+    lbl_per_hdr_next = tk.Label(
+        per_mov_hdr,
+        text="Prossima creaz. ▲",
+        bg=header_bg,
+        fg=header_fg,
+        font=header_font,
+        anchor="w",
+        cursor="hand2",
     )
-    tk.Label(per_mov_hdr, text="Categoria", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(
-        row=0, column=4, sticky="ew"
+    lbl_per_hdr_next.grid(row=0, column=3, sticky="ew")
+    lbl_per_hdr_cat = tk.Label(
+        per_mov_hdr,
+        text="Categoria",
+        bg=header_bg,
+        fg=header_fg,
+        font=header_font,
+        anchor="w",
+        cursor="hand2",
     )
-    tk.Label(per_mov_hdr, text="Conto", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(
-        row=0, column=5, sticky="ew"
+    lbl_per_hdr_cat.grid(row=0, column=4, sticky="ew")
+    lbl_per_hdr_acc1 = tk.Label(
+        per_mov_hdr,
+        text="Conto",
+        bg=header_bg,
+        fg=header_fg,
+        font=header_font,
+        anchor="w",
+        cursor="hand2",
     )
+    lbl_per_hdr_acc1.grid(row=0, column=5, sticky="ew")
     tk.Label(per_mov_hdr, text="Secondo conto", bg=header_bg, fg=header_fg, font=header_font, anchor="w").grid(
         row=0, column=6, sticky="ew"
     )
@@ -19007,12 +19031,6 @@ th {{ background:#efefef; text-align:left; }}
         chq = "Periodica"
         return ("", cad, last_it, next_it, cat, apt, ap2, chq)
 
-    def _per_rule_next_sort_key(rule: dict) -> tuple[int, str, str]:
-        if not rule.get("active", True):
-            return (1, "9999-12-31", str(rule.get("id") or ""))
-        nd = periodiche.next_due_date(rule)
-        return (0, nd.isoformat() if nd else "9999-12-31", str(rule.get("id") or ""))
-
     def _per_rule_note_cell(rule: dict) -> str:
         tpl = rule.get("template") or {}
         n = str(tpl.get("note") or "")
@@ -19020,12 +19038,34 @@ th {{ background:#efefef; text-align:left; }}
             return "—"
         return n
 
+    def _per_sort_hdr_text(col: str) -> str:
+        base = _PER_SORT_HDR[col]
+        if per_tree_sort[0] != col:
+            return base
+        return f"{base} {'▼' if per_tree_sort_reverse[0] else '▲'}"
+
+    def _per_refresh_hdr_sort_marks() -> None:
+        for col, lbl in (
+            ("next", lbl_per_hdr_next),
+            ("cat", lbl_per_hdr_cat),
+            ("acc1", lbl_per_hdr_acc1),
+        ):
+            try:
+                lbl.configure(text=_per_sort_hdr_text(col))
+            except tk.TclError:
+                pass
+
     def _per_refresh_tree() -> None:
+        sel = _per_current_selected_id()
         tree_per.delete(*tree_per.get_children())
         tree_per_amt.delete(*tree_per_amt.get_children())
         tree_per_note.delete(*tree_per_note.get_children())
         row_i = 0
-        rules_sorted = sorted(cur_db().get("periodic_registrations", []), key=_per_rule_next_sort_key)
+        rules_sorted = periodiche.sort_rules_for_grid(
+            list(cur_db().get("periodic_registrations", []) or []),
+            by=per_tree_sort[0],
+            reverse=per_tree_sort_reverse[0],
+        )
         for rule in rules_sorted:
             rid = str(rule.get("id", ""))
             if not rid:
@@ -19036,8 +19076,33 @@ th {{ background:#efefef; text-align:left; }}
             amt_txt, amt_tag = _per_rule_amt_display_and_tag(rule)
             tree_per_amt.insert("", tk.END, iid=rid, values=(amt_txt,), tags=(amt_tag, stripe))
             tree_per_note.insert("", tk.END, iid=rid, values=(_per_rule_note_cell(rule),), tags=(stripe,))
+        if sel:
+            for t in (tree_per, tree_per_amt, tree_per_note):
+                try:
+                    if sel in t.get_children():
+                        t.selection_set(sel)
+                        t.focus(sel)
+                        t.see(sel)
+                except tk.TclError:
+                    pass
         _per_refresh_action_buttons()
         root.after_idle(_sync_per_mov_hdr_layout)
+
+    def _per_on_sort_header(col: str) -> None:
+        if per_tree_sort[0] == col:
+            per_tree_sort_reverse[0] = not per_tree_sort_reverse[0]
+        else:
+            per_tree_sort[0] = col
+            per_tree_sort_reverse[0] = False
+        _per_refresh_hdr_sort_marks()
+        _per_refresh_tree()
+
+    for _col, _lbl in (
+        ("next", lbl_per_hdr_next),
+        ("cat", lbl_per_hdr_cat),
+        ("acc1", lbl_per_hdr_acc1),
+    ):
+        _lbl.bind("<Button-1>", lambda _e, c=_col: _per_on_sort_header(c))
 
     def _per_clear_form() -> None:
         per_edit_rule_id[0] = None

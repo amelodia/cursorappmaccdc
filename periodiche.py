@@ -309,3 +309,55 @@ def list_due_rules(db: dict, today: date) -> list[dict]:
 
 def new_rule_id() -> str:
     return str(uuid.uuid4())
+
+
+def _grid_next_iso(rule: dict) -> str:
+    nd = next_due_date(rule)
+    return nd.isoformat() if nd else "9999-12-31"
+
+
+def _grid_category_sort_name(rule: dict) -> str:
+    tpl = rule.get("template") or {}
+    raw = str(tpl.get("category_name") or "").strip()
+    if raw[:1] in "+-":
+        raw = raw[1:].strip()
+    return raw.casefold()
+
+
+def _grid_account_sort_name(rule: dict) -> str:
+    tpl = rule.get("template") or {}
+    return str(tpl.get("account_primary_name") or "").strip().casefold()
+
+
+def sort_rules_for_grid(
+    rules: list[dict],
+    *,
+    by: str = "next",
+    reverse: bool = False,
+) -> list[dict]:
+    """Ordina le regole della griglia: prossima esecuzione (default), categoria o conto.
+
+    Con ordinamento per data le regole inattive restano in fondo.
+    """
+    items = [r for r in rules if isinstance(r, dict)]
+
+    def _rid(r: dict) -> str:
+        return str(r.get("id") or "")
+
+    if by == "cat":
+        items.sort(
+            key=lambda r: (_grid_category_sort_name(r), _grid_next_iso(r), _rid(r)),
+            reverse=reverse,
+        )
+        return items
+    if by == "acc1":
+        items.sort(
+            key=lambda r: (_grid_account_sort_name(r), _grid_next_iso(r), _rid(r)),
+            reverse=reverse,
+        )
+        return items
+    active = [r for r in items if r.get("active", True)]
+    inactive = [r for r in items if not r.get("active", True)]
+    active.sort(key=lambda r: (_grid_next_iso(r), _rid(r)), reverse=reverse)
+    inactive.sort(key=lambda r: (_grid_next_iso(r), _rid(r)), reverse=reverse)
+    return active + inactive
