@@ -5495,6 +5495,36 @@ def normalize_stmt_balance_hint_for_account(db: dict, acc_code: str, val: Decima
     return iq
 
 
+def first_day_of_month_after(d: date) -> date:
+    """Primo giorno del mese successivo a ``d`` (es. 19/09 → 01/10; 31/12 → 01/01)."""
+    if d.month == 12:
+        return date(d.year + 1, 1, 1)
+    return date(d.year, d.month + 1, 1)
+
+
+def verification_close_can_skip_confirm(
+    *,
+    pending_unverified: int,
+    pdf_queue_remaining: bool,
+    match_ok: bool,
+) -> bool:
+    """True se si può chiudere senza chiedere conferma: nessun sospeso e differenza verifica a zero."""
+    return (not pdf_queue_remaining) and int(pending_unverified or 0) == 0 and bool(match_ok)
+
+
+def credit_card_close_settlement_amount(stmt_balance: object | None) -> Decimal | None:
+    """Importo girata di chiusura carta: saldo estratto in negativo; None se assente o zero."""
+    if stmt_balance is None:
+        return None
+    try:
+        q = Decimal(str(stmt_balance)).quantize(Decimal("0.01"))
+    except Exception:
+        return None
+    if q == 0:
+        return None
+    return -abs(q)
+
+
 def record_touches_credit_card_account(db: dict, rec: dict) -> bool:
     """True se il primo o il secondo conto della registrazione è un conto carta (flag ``credit_card`` nel piano)."""
     for key in ("account_primary_code", "account_secondary_code"):
@@ -17856,6 +17886,61 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
+    def _prefill_newreg_credit_card_settlement(
+        *,
+        ref_name: str,
+        cc_name: str,
+        movement_iso: str,
+        amount: Decimal,
+    ) -> None:
+        """Predispone Girata dal conto di riferimento al conto carta (importo negativo, data già calcolata)."""
+        giro_code = next((c for n, c in cat_opts_cache if _is_giro_label(n)), "1")
+        _set_category_by_code(giro_code)
+        try:
+            dmin, dmax = immissione_date_bounds()
+            dmov = date.fromisoformat(movement_iso)
+            dmov = max(dmin, min(dmov, dmax))
+            movement_iso = dmov.isoformat()
+        except Exception:
+            pass
+        newreg_date_var.set(to_italian_date(movement_iso))
+        newreg_date_manual_mode[0] = False
+        newreg_acc1_var.set(ref_name)
+        newreg_acc2_var.set(cc_name)
+        newreg_last_account_touched[0] = "acc1"
+        _sync_cat_note_and_second_account()
+        newreg_acc1_var.set(ref_name)
+        newreg_acc2_var.set(cc_name)
+        try:
+            vals1 = list(cb_acc1.cget("values") or ())
+            a1n = (newreg_acc1_var.get() or "").strip()
+            if a1n and a1n in vals1:
+                cb_acc1.current(vals1.index(a1n))
+        except Exception:
+            pass
+        try:
+            vals2 = list(cb_acc2.cget("values") or ())
+            a2n = (newreg_acc2_var.get() or "").strip()
+            if a2n and a2n in vals2:
+                cb_acc2.current(vals2.index(a2n))
+        except Exception:
+            pass
+        q_amt = amount.quantize(Decimal("0.01"))
+        newreg_amount_var.set("-" + format_euro_it(abs(q_amt)))
+        newreg_sign_var.set("-")
+        _format_amount_entry()
+        newreg_baseline_snapshot[0] = _newreg_form_snapshot()
+        try:
+            ent_amt.focus_set()
+            ent_amt.selection_clear()
+            ra = (newreg_amount_var.get() or "").strip()
+            if ra in ("+", "-"):
+                ent_amt.icursor(1)
+            else:
+                ent_amt.icursor(tk.END)
+        except Exception:
+            pass
+
     def _collect_new_record_payload() -> tuple[dict, str] | None:
         d_iso = parse_italian_ddmmyyyy_to_iso(newreg_date_var.get())
         if not d_iso:
@@ -23630,7 +23715,10 @@ th {{ background:#efefef; text-align:left; }}
         refresh_results: bool,
         done_message: bool,
     ) -> bool:
-        """Inserisce la girata di chiusura verifica carta + ``**`` sul lato carta. Ritorna True se salvato."""
+        """Inserisce la girata di chiusura verifica carta + ``**`` sul lato carta. Ritorna True se salvato.
+
+        «Chiudi verifica» con saldo a zero non la chiama più: predispone la girata in Nuove registrazioni.
+        """
         acc_code = str(acc_code or "").strip()
         if not acc_code or not account_is_credit_card_by_code(d, acc_code):
             return False
@@ -27076,101 +27164,87 @@ th {{ background:#efefef; text-align:left; }}
         except Exception:
             pass
 
+    def _ver_stmt_balance_for_summary() -> Decimal | None:
+        raw_sb = ver_stmt_balance_var.get().strip()
+        if raw_sb:
+            try:
+                return normalize_euro_input(raw_sb.replace(" ", ""))
+            except Exception:
+                pass
+        vp = ver_print_data[0]
+        if isinstance(vp, dict) and vp.get("stmt_balance") is not None:
+            try:
+                return Decimal(str(vp["stmt_balance"]))
+            except Exception:
+                return None
+        return None
+
     def _ver_on_close() -> None:
         ver_amt_focusout_suppress_once[0] = True
         acc_code = ver_account_code_var.get().strip()
         need_resume = _ver_count_pending_rows() > 0 or bool(ver_bancoposta_queue[0])
         d_pre = cur_db()
-        cc_close_with_girata = False
-        pd_cc: dict | None = None
-        if not need_resume and acc_code and account_is_credit_card_by_code(d_pre, acc_code):
-            raw_sb = ver_stmt_balance_var.get().strip()
-            sb_try: Decimal | None = None
-            if raw_sb:
-                try:
-                    sb_try = normalize_euro_input(raw_sb.replace(" ", ""))
-                except Exception:
-                    sb_try = None
-            # Fallback se la StringVar non era stata impostata (prima bastava vedere solo il riepilogo a schermo).
-            if sb_try is None:
-                vp = ver_print_data[0]
-                if isinstance(vp, dict) and vp.get("stmt_balance") is not None:
-                    try:
-                        sb_try = Decimal(str(vp["stmt_balance"]))
-                    except Exception:
-                        sb_try = None
-            if sb_try is not None and _ver_all_verified(acc_code):
-                pd0, _, _, _, _ = _ver_verification_summary(
-                    d_pre,
-                    acc_code,
-                    cutoff_raw=ver_cutoff_date_var.get().strip(),
-                    stmt_balance=sb_try,
+        sb_try = _ver_stmt_balance_for_summary()
+        pd_close: dict | None = None
+        match_ok = False
+        if acc_code and sb_try is not None:
+            pd_close, _, _, _, _ = _ver_verification_summary(
+                d_pre,
+                acc_code,
+                cutoff_raw=ver_cutoff_date_var.get().strip(),
+                stmt_balance=sb_try,
+            )
+            match_ok = bool(pd_close.get("match_ok"))
+        skip_confirm = verification_close_can_skip_confirm(
+            pending_unverified=_ver_count_pending_rows(),
+            pdf_queue_remaining=bool(ver_bancoposta_queue[0]),
+            match_ok=match_ok,
+        )
+        cc_draft: dict | None = None
+        if skip_confirm and acc_code and account_is_credit_card_by_code(d_pre, acc_code):
+            stmt_for_amt = None
+            if pd_close is not None and pd_close.get("stmt_balance") is not None:
+                stmt_for_amt = pd_close.get("stmt_balance")
+            else:
+                stmt_for_amt = sb_try
+            amt_cc = credit_card_close_settlement_amount(stmt_for_amt)
+            if amt_cc is not None and not virtuale_discharge_active[0]:
+                ref_cd = credit_card_reference_code_str(d_pre, acc_code)
+                acc_cc = account_dict_for_code_latest_year(d_pre, acc_code)
+                acc_ref = account_dict_for_code_latest_year(d_pre, str(ref_cd or ""))
+                nm_cc = str((acc_cc or {}).get("name") or "").strip()
+                nm_ref = str((acc_ref or {}).get("name") or "").strip()
+                frozen = account_code_is_frozen(d_pre, acc_code) or (
+                    bool(ref_cd) and account_code_is_frozen(d_pre, str(ref_cd))
                 )
-                if bool(pd0.get("match_ok")):
-                    bal_c = pd0.get("current_balance", Decimal("0"))
-                    if not isinstance(bal_c, Decimal):
-                        try:
-                            bal_c = Decimal(str(bal_c))
-                        except Exception:
-                            bal_c = Decimal("0")
-                    if abs(bal_c) >= Decimal("0.005"):
-                        cc_close_with_girata = True
-                        pd_cc = pd0
+                if acc_cc and acc_ref and nm_cc and nm_ref and not frozen:
+                    cutoff_raw = ver_cutoff_date_var.get().strip()
+                    try:
+                        cutoff_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
+                    except Exception:
+                        cutoff_iso = None
+                    if not cutoff_iso:
+                        cutoff_iso = date.today().isoformat()
+                    d_mov = first_day_of_month_after(date.fromisoformat(cutoff_iso))
+                    cc_draft = {
+                        "ref_name": nm_ref,
+                        "cc_name": nm_cc,
+                        "iso": d_mov.isoformat(),
+                        "amount": amt_cc,
+                    }
 
-        if cc_close_with_girata and pd_cc is not None:
-            ref_cd = credit_card_reference_code_str(d_pre, acc_code)
-            acc_cc = account_dict_for_code_latest_year(d_pre, acc_code)
-            acc_ref = account_dict_for_code_latest_year(d_pre, str(ref_cd or ""))
-            nm_cc = str((acc_cc or {}).get("name") or "").strip()
-            nm_ref = str((acc_ref or {}).get("name") or "").strip()
-            bal_x = pd_cc.get("current_balance", Decimal("0"))
-            if not isinstance(bal_x, Decimal):
-                try:
-                    bal_x = Decimal(str(bal_x))
-                except Exception:
-                    bal_x = Decimal("0")
-            amt_x = (-bal_x).quantize(Decimal("0.01"))
-            if amt_x < 0:
-                amt_x = abs(amt_x)
-            stmt_pdf = pd_cc.get("stmt_balance")
-            try:
-                stmt_pdf_d = Decimal(str(stmt_pdf)) if stmt_pdf is not None else bal_x
-            except Exception:
-                stmt_pdf_d = bal_x
-            estratto_pos_txt = "+" + format_euro_it(abs(stmt_pdf_d.quantize(Decimal("0.01")))) + " €"
-            n_uv = int(pd_cc.get("count_unverified", 0) or 0)
-            uv_tail = (
-                f"\n\nSul conto carta risultano ancora {n_uv} registrazioni non verificate "
-                "(la coincidenza con l'estratto riguarda il confronto saldi, non l'azzeramento delle singole righe)."
-                if n_uv > 0
-                else ""
-            )
-            close_msg = (
-                "Chiudendo la verifica verrà registrata una Girata conto/conto sul conto di riferimento "
-                "(saldo carta non a zero):\n\n"
-                f"• Saldo estratto conto (come in estratto, in positivo): {estratto_pos_txt}\n"
-                f"• Dal conto: {nm_cc}\n"
-                f"• Al conto: {nm_ref}\n"
-                f"• Importo registrazione (Girata positiva — scarico carta / addebito sul conto di riferimento): "
-                f"{('+' if amt_x >= 0 else '')}{format_euro_it(amt_x)} €\n\n"
-                "L'importo è registrato in positivo (valore assoluto se necessario); coincide di solito con "
-                "l'importo dovuto sull'estratto in valore assoluto. "
-                "(Senza inversione di segno sul secondo conto nelle schermate di verifica.)"
-                f"{uv_tail}\n\n"
-                "«Annulla» resta in questa pagina. «OK» salva la girata e chiude la sessione di verifica."
-            )
-        else:
+        if not skip_confirm:
             close_msg = (
                 "Uscire dalla verifica?\n\n"
                 "«Annulla» resta in questa pagina; «OK» chiude la sessione di verifica."
             )
-        try:
-            if not messagebox.askokcancel("Chiudi verifica", close_msg, parent=verifica_frame):
+            try:
+                if not messagebox.askokcancel("Chiudi verifica", close_msg, parent=verifica_frame):
+                    ver_amt_focusout_suppress_once[0] = False
+                    return
+            except tk.TclError:
                 ver_amt_focusout_suppress_once[0] = False
                 return
-        except tk.TclError:
-            ver_amt_focusout_suppress_once[0] = False
-            return
 
         n_sosp = _ver_count_pending_rows()
         acc_nm = ver_account_name_var.get().strip() or "—"
@@ -27206,25 +27280,7 @@ th {{ background:#efefef; text-align:left; }}
                 )
         else:
             acc_code_close = ver_account_code_var.get().strip()
-            if cc_close_with_girata and pd_cc is not None:
-                if not _ver_cc_settlement_try_execute(
-                    cur_db(),
-                    acc_code_close,
-                    pd_cc,
-                    parent=verifica_frame,
-                    confirm_dialog=False,
-                    refresh_results=False,
-                    done_message=False,
-                ):
-                    ver_amt_focusout_suppress_once[0] = False
-                    return
-                if acc_code_close:
-                    try:
-                        _ver_clear_pending_from_db(acc_code_close)
-                        persist_db_after_edit(None)
-                    except Exception:
-                        pass
-            elif acc_code_close:
+            if acc_code_close:
                 saved_disk = _ver_load_pending_from_db(acc_code_close)
                 if not _ver_saved_has_verification_in_sospeso(saved_disk):
                     try:
@@ -27233,6 +27289,26 @@ th {{ background:#efefef; text-align:left; }}
                     except Exception:
                         pass
         _ver_apply_full_verification_teardown()
+
+        if skip_confirm:
+            try:
+                messagebox.showinfo(
+                    "Chiudi verifica",
+                    f"Verifica del conto {acc_nm} chiusa.",
+                    parent=root,
+                )
+            except tk.TclError:
+                pass
+            if cc_draft is not None:
+                _cdc_select(nuovi_dati_frame)
+                _prefill_newreg_credit_card_settlement(
+                    ref_name=str(cc_draft["ref_name"]),
+                    cc_name=str(cc_draft["cc_name"]),
+                    movement_iso=str(cc_draft["iso"]),
+                    amount=cc_draft["amount"],
+                )
+            else:
+                _cdc_select(movimenti_frame)
 
     ver_btn_close.bind("<ButtonPress-1>", _ver_suppress_next_amt_focusout_check, add="+")
     ver_btn_close.bind("<Button-1>", lambda _e: _ver_on_close())
