@@ -81,6 +81,10 @@ _AMT_RE = re.compile(r"^((?:\d{1,3}(?:\.\d{3})*|\d+),\d{2})\s*(?:€|EUR)?\s*$",
 # mangi ``20`` come anno a 2 cifre lasciando ``2699,93`` come importo.
 _DATE_Y = r"\d{2}/\d{2}/(?:\d{4}|\d{2})"
 _AMT_CORE = r"(?:\d{1,3}(?:\.\d{3})*|\d+),\d{2}"
+# Importo italiano in coda riga Amex: massimo 3 cifre intere oppure migliaia con punto
+# (``1.642,16``). Senza questa restrizione ``\d+`` inghiotte il riferimento PayPal
+# (``0789292953127,50`` → 789 miliardi invece di ``127,50``).
+_AMT_CORE_TRAILING = r"(?:\d{1,3}(?:\.\d{3})+|\d{1,3}),\d{2}"
 
 
 def _sanitize_closing_line_for_amount_scan(s: str) -> str:
@@ -430,6 +434,8 @@ def _skip_description(desc: str) -> bool:
         return True
     if "TOTALE ACC" in u:
         return True
+    if re.match(r"^TOTALE\b", u):
+        return True
     if "SALDOFINALE" in c or "SALDO FINALE" in u:
         return True
     if "ADDEBITO" in u and "C/C" in u and "BUON FINE" in u:
@@ -458,6 +464,8 @@ def _line_is_summary_not_movement(line: str) -> bool:
     if "TOTALE AD" in u and "BIT" in u:
         return True
     if "TOTALE ACC" in u:
+        return True
+    if re.match(r"^TOTALE\b", u):
         return True
     if "ADDEBITO" in u and "C/C" in u and "BUON FINE" in u:
         return True
@@ -549,6 +557,8 @@ def _note_looks_like_summary_row(note: str) -> bool:
     if "SALDOPRECEDENTE" in c or "IMPORTODOVUTO" in c or "ESTRATTOCONTOATTUALE" in c:
         return True
     if "SALDOINIZIALE" in c or "SALDO INIZIALE" in u or "TOTALE ENTRATE" in u or "TOTALE USCITE" in u:
+        return True
+    if re.match(r"^TOTALE\b", u) or "TOTALENUOVEOPERAZIONI" in c or "TOTALEINTERESSI" in c:
         return True
     if "SALDOFINALE" in c or "SALDO FINALE" in u:
         return True
@@ -1162,6 +1172,8 @@ def _should_append_continuation(
         return False
     if "TOTALE ENTRATE" in lu or "TOTALE USCITE" in lu or "SALDO FINALE" in lu or "SALDO INIZIALE" in lu:
         return False
+    if re.match(r"^TOTALE\b", lu):
+        return False
     if "SALDO CONTABILE" in lu or "SALDO DISPONIBILE" in lu:
         return False
     if re.match(r"^Pag\.", s, re.I):
@@ -1253,7 +1265,7 @@ def _parse_two_date_desc_amount_from_line_tail(
                     row["note"] = ((note0 + " CR").strip())[:max_note_len]
             return row
     m_amt = re.search(
-        rf"(?<![0-9,.])({_AMT_CORE})({_AMT_LINE_SUFFIX})(?:\s+CR\s*)?$",
+        rf"({_AMT_CORE_TRAILING})({_AMT_LINE_SUFFIX})(?:\s+CR\s*)?$",
         s,
         re.I,
     )
@@ -1460,9 +1472,9 @@ def _amex_merge_wrapped_statement_lines(lines: list[str], *, max_note_len: int) 
     """
     Unisce righe spezzate a metà riga (importo/causale sulla riga successiva senza data iniziale).
 
-    Si ferma quando la riga successiva inizia con ``gg/mm/(aa|aaaa)`` e la corrente è già un movimento
-    completo (evita di incollare due movimenti). Le righe di sola continuazione nota restano separate:
-    se la corrente è già un movimento valido e unirla alla successiva rompe il parse, non si unisce.
+    Se la corrente è già un movimento completo **non** si unisce altro (anche se il merge parrebbe
+    ancora un movimento): altrimenti un totale di sezione in coda (``Totale nuove operazioni 1.642,16``)
+    ruba l'importo al movimento precedente. Le righe di sola continuazione nota restano separate.
     """
     re_bol_date = re.compile(r"^\d{2}/\d{2}/(?:\d{4}|\d{2})\b")
     out: list[str] = []
@@ -1481,20 +1493,20 @@ def _amex_merge_wrapped_statement_lines(lines: list[str], *, max_note_len: int) 
                 continue
             if nxt == _AMEX_BLOCK_MARKER:
                 break
+            if _line_is_summary_not_movement(nxt):
+                break
             merged = _normalize_pdf_line(cur + " " + raw_next)
             bol_next = bool(re_bol_date.match(nxt))
             p_cur = _parse_movement_line(cur, max_note_len=max_note_len)
             p_mrg = _parse_movement_line(merged, max_note_len=max_note_len)
 
-            if bol_next and p_cur is not None:
+            if p_cur is not None:
                 break
             if bol_next and p_cur is None:
                 if p_mrg is not None:
                     cur = merged
                     i += 1
                     continue
-                break
-            if p_cur is not None and p_mrg is None:
                 break
             if p_cur is None and p_mrg is None and merges > 14:
                 break
@@ -1558,6 +1570,9 @@ def _amex_filter_non_movement_rows(rows: list[dict[str, object]]) -> list[dict[s
         if "ADDEBITO" in u and "C/C" in u and "BUON FINE" in u:
             continue
         if "ADDEBITOINCC" in c and "BUONFINE" in c:
+            continue
+        amt = r.get("amount")
+        if isinstance(amt, Decimal) and abs(amt) >= Decimal("10000000"):
             continue
         out.append(r)
     return out

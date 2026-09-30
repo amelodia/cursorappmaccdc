@@ -3701,6 +3701,27 @@ def _ver_summary_diff_line_color(match_ok: bool) -> str:
     return "#2e7d32" if match_ok else "#c62828"
 
 
+VER_SUMMARY_DIFF_ROW_LABEL = "Differenza tra Proiezione e Conti di casa"
+
+
+def verification_report_opening_title(acc_name: str, *, is_credit_card: bool) -> str:
+    """Titolo di apertura del rapporto verifica: nome conto e se è banca o carta."""
+    nm = (acc_name or "").strip() or "—"
+    kind = "conto carta" if is_credit_card else "conto bancario"
+    return f"Verifica conto {nm} ({kind})"
+
+
+def _ver_unverified_value_row_label(count_unverified: int) -> str:
+    n = int(count_unverified)
+    if n == 1:
+        return "Valore di 1 registrazione non verificata"
+    return f"Valore di {n} registrazioni non verificate"
+
+
+def _ver_summary_is_diff_row(desc: str) -> bool:
+    return str(desc or "").strip() == VER_SUMMARY_DIFF_ROW_LABEL
+
+
 def _ver_summary_row_definitions(
     *,
     count_unverified: int,
@@ -3710,13 +3731,13 @@ def _ver_summary_row_definitions(
     saldo_assoluto: Decimal,
     diff: Decimal,
 ) -> tuple[tuple[str, Decimal], ...]:
-    """Voci testuali del rapporto di stampa verifica (tabella Riepilogo). Ordine richiesto dall'interfaccia."""
+    """Voci del riepilogo verifica (schermo e PDF). Importi = valori contabili, senza inversione carta."""
     return (
-        (f"N. {count_unverified} registrazioni non verificate, con valore", sum_unverified),
-        ("Estratto conto bancario", stmt_balance),
-        ("Proiezione dell'estratto conto bancario", projected_estratto),
-        ("Saldo assoluto di conti di casa", saldo_assoluto),
-        ("Differenza", diff),
+        (_ver_unverified_value_row_label(count_unverified), sum_unverified),
+        ("Saldo dell'estratto conto", stmt_balance),
+        ("Proiezione del saldo", projected_estratto),
+        ("Saldo Conti di casa", saldo_assoluto),
+        (VER_SUMMARY_DIFF_ROW_LABEL, diff),
     )
 
 
@@ -6469,6 +6490,7 @@ def save_verifica_results_pdf(
     unver_rows: list[tuple[str, ...]],
     pd: dict,
     match_ok: bool,
+    is_credit_card: bool = False,
 ) -> bool:
     """Scrive il PDF «Stampa risultati»: cartella da Opzioni (rapporto fine verifica e/o estratti), nome da modello."""
     try:
@@ -6536,10 +6558,11 @@ def save_verifica_results_pdf(
             new_y=YPos.NEXT,
         )
         pdf.set_font("Helvetica", "B", 11)
+        heading = verification_report_opening_title(acc_name, is_credit_card=is_credit_card)
         pdf.cell(
             0,
             7,
-            _pdf_safe_text(f"Verifica conto: {acc_name}") + _pdf_safe_text(f" — Chiusura: {cutoff_display}"),
+            _pdf_safe_text(heading) + _pdf_safe_text(f" — Chiusura: {cutoff_display}"),
             align="L",
             new_x=XPos.LMARGIN,
             new_y=YPos.NEXT,
@@ -6660,7 +6683,7 @@ def save_verifica_results_pdf(
         amt_w = 55.0
         row_gap = 5.8
         for desc, val in spec_rows:
-            is_diff_row = desc == "Differenza"
+            is_diff_row = _ver_summary_is_diff_row(desc)
             amt_col = _ver_summary_diff_line_color(bool(match_ok)) if is_diff_row else _ver_summary_amount_line_color(val)
             r, gg, bb = _hex_to_rgb_triplet(amt_col)
             pdf.set_font("Helvetica", "B" if is_diff_row else "", 10 if is_diff_row else 9)
@@ -8959,6 +8982,108 @@ def apply_account_verification_star_count(rec: dict, which: str, stars: int) -> 
     code = str(rec.get(ck) or "").strip()
     fl = str(rec.get(fk) or "")
     rec[wk] = f"{code}{fl}" if code else ""
+
+
+def newreg_matches_credit_card_settlement_draft(
+    rec: dict,
+    *,
+    ref_code: str,
+    cc_code: str,
+) -> bool:
+    """True se la registrazione è la Girata di chiusura carta (banca di riferimento ↔ conto carta)."""
+    if not is_giroconto_record(rec):
+        return False
+    ref_c = str(ref_code or "").strip()
+    cc_c = str(cc_code or "").strip()
+    if not ref_c or not cc_c:
+        return False
+    c1 = str(rec.get("account_primary_code") or "").strip()
+    c2 = str(rec.get("account_secondary_code") or "").strip()
+    if not c1 or not c2:
+        return False
+    bank_then_card = account_codes_match_for_verification(c1, ref_c) and account_codes_match_for_verification(
+        c2, cc_c
+    )
+    card_then_bank = account_codes_match_for_verification(c1, cc_c) and account_codes_match_for_verification(
+        c2, ref_c
+    )
+    return bank_then_card or card_then_bank
+
+
+def apply_credit_card_settlement_verification_star(
+    ordered: list[tuple[int, dict]],
+    *,
+    card_code: str,
+    settle_rec: dict,
+) -> bool:
+    """Spunta di verifica sul lato carta della girata di chiusura; il conto bancario resta senza ``*``.
+
+    Mette ``*`` sul conto carta. Se tra l'attuale confine ``**`` e questa girata non ci sono buchi
+    Movimenti-visibili senza ``*`` sullo stesso conto, il ``**`` precedente diventa ``*`` e il ``**``
+    passa sulla girata (lato carta). Non avanza il confine oltre buchi aperti.
+    """
+    ac = str(card_code or "").strip()
+    if not ac or not settle_rec:
+        return False
+    sides = record_sides_touching_account_code(settle_rec, ac)
+    if not sides:
+        return False
+    card_side = sides[0]
+    apply_account_verification_star_count(settle_rec, card_side, 1)
+
+    settle_n: int | None = None
+    for reg_n, rec in ordered:
+        if rec is settle_rec:
+            settle_n = int(reg_n)
+            break
+    if settle_n is None:
+        return True
+
+    floor_reg: int | None = None
+    floor_rec: dict | None = None
+    floor_side: str | None = None
+    for reg_n, rec in reversed(ordered):
+        if rec.get("is_cancelled"):
+            continue
+        rec_sides = record_sides_touching_account_code(rec, ac)
+        if not rec_sides:
+            continue
+        for side in rec_sides:
+            fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
+            f = str(rec.get(fk) or "")
+            if "*" in f and verification_flag_star_equivalent_count(f) >= 2:
+                floor_reg = int(reg_n)
+                floor_rec = rec
+                floor_side = side
+                break
+        if floor_reg is not None:
+            break
+
+    start_scan = (floor_reg + 1) if floor_reg is not None else 0
+    for reg_n, rec in ordered:
+        if int(reg_n) < start_scan or int(reg_n) >= settle_n:
+            continue
+        if rec.get("is_cancelled") or rec is settle_rec:
+            continue
+        rec_sides = record_sides_touching_account_code(rec, ac)
+        if not rec_sides:
+            continue
+        best_st = 0
+        for side in rec_sides:
+            fk = "account_primary_flags" if side == "primary" else "account_secondary_flags"
+            st = verification_flag_star_equivalent_count(str(rec.get(fk) or ""))
+            if st > best_st:
+                best_st = st
+        if verification_unmarked_movimenti_breaks_double_star_chain(
+            stars=best_st,
+            in_movimenti=show_record_in_movements_grid(rec),
+        ):
+            return True
+
+    if floor_rec is not None and floor_side is not None and floor_rec is not settle_rec:
+        apply_account_verification_star_count(floor_rec, floor_side, 1)
+    apply_account_verification_star_count(settle_rec, card_side, 2)
+    return True
 
 
 def record_sides_touching_account_code(rec: dict, account_code: str) -> list[str]:
@@ -16503,6 +16628,7 @@ th {{ background:#efefef; text-align:left; }}
     last_acc2_code = ""
     newreg_baseline_snapshot: list[tuple[object, ...] | None] = [None]
     newreg_last_account_touched: list[str] = ["acc1"]
+    newreg_cc_settlement_pending: list[dict[str, str] | None] = [None]
 
     def _all_records_sorted() -> list[dict]:
         rs = [r for y in cur_db().get("years", []) for r in y.get("records", [])]
@@ -17861,6 +17987,7 @@ th {{ background:#efefef; text-align:left; }}
         newreg_note_var.set("")
         newreg_baseline_snapshot[0] = _newreg_form_snapshot()
         newreg_last_account_touched[0] = "acc1"
+        newreg_cc_settlement_pending[0] = None
         try:
             vals1 = list(cb_acc1.cget("values") or ())
             a1n = (newreg_acc1_var.get() or "").strip()
@@ -17890,10 +18017,16 @@ th {{ background:#efefef; text-align:left; }}
         *,
         ref_name: str,
         cc_name: str,
+        ref_code: str,
+        cc_code: str,
         movement_iso: str,
         amount: Decimal,
     ) -> None:
         """Predispone Girata dal conto di riferimento al conto carta (importo negativo, data già calcolata)."""
+        newreg_cc_settlement_pending[0] = {
+            "ref_code": str(ref_code or "").strip(),
+            "cc_code": str(cc_code or "").strip(),
+        }
         giro_code = next((c for n, c in cat_opts_cache if _is_giro_label(n)), "1")
         _set_category_by_code(giro_code)
         try:
@@ -18094,6 +18227,21 @@ th {{ background:#efefef; text-align:left; }}
             rec["display_amount"] = format_money(saved_amt)
         y_bucket = _ensure_year_bucket(int(rec["year"]))
         y_bucket["records"].append(rec)
+        draft_cc = newreg_cc_settlement_pending[0]
+        newreg_cc_settlement_pending[0] = None
+        if isinstance(draft_cc, dict):
+            ref_c = str(draft_cc.get("ref_code") or "").strip()
+            cc_c = str(draft_cc.get("cc_code") or "").strip()
+            if ref_c and cc_c and newreg_matches_credit_card_settlement_draft(
+                rec, ref_code=ref_c, cc_code=cc_c
+            ):
+                all_cc = [r for y in cur_db().get("years", []) for r in y.get("records", [])]
+                all_cc.sort(key=record_merge_sort_key)
+                cc_map = unified_registration_sequence_map(all_cc)
+                ordered_cc = [(cc_map[record_legacy_stable_key(r)], r) for r in all_cc]
+                apply_credit_card_settlement_verification_star(
+                    ordered_cc, card_code=cc_c, settle_rec=rec
+                )
         try:
             save_encrypted_db_dual(
                 cur_db(),
@@ -23499,30 +23647,24 @@ th {{ background:#efefef; text-align:left; }}
         sum_bg = str(_palette_runtime_attr("CDC_GRID_STRIPE1_BG") or CDC_GRID_STRIPE1_BG)
         sum_fg = "#1a1a1a"
         acc_cc_sum = ver_account_code_var.get().strip()
-        cc_debit_disp = bool(acc_cc_sum) and account_is_credit_card_by_code(cur_db(), acc_cc_sum)
-
-        def _ccd(v: object) -> Decimal:
-            try:
-                d0 = v if isinstance(v, Decimal) else Decimal(str(v))
-            except Exception:
-                d0 = Decimal("0")
-            return (-d0) if cc_debit_disp else d0
+        acc_nm_sum = ver_account_name_var.get().strip()
+        try:
+            ver_summary_title_lbl.configure(
+                text=verification_report_opening_title(
+                    acc_nm_sum,
+                    is_credit_card=bool(acc_cc_sum)
+                    and account_is_credit_card_by_code(cur_db(), acc_cc_sum),
+                )
+            )
+        except tk.TclError:
+            pass
 
         for i, (desc, val) in enumerate(rows):
-            if cc_debit_disp and (
-                desc.startswith("N.")
-                or desc == "Estratto conto bancario"
-                or desc.startswith("Proiezione dell'estratto conto bancario")
-                or desc == "Saldo assoluto di conti di casa"
-                or desc == "Differenza"
-            ):
-                disp_val = _ccd(val)
-            else:
-                try:
-                    disp_val = val if isinstance(val, Decimal) else Decimal(str(val))
-                except Exception:
-                    disp_val = Decimal("0")
-            is_diff = desc == "Differenza"
+            try:
+                disp_val = val if isinstance(val, Decimal) else Decimal(str(val))
+            except Exception:
+                disp_val = Decimal("0")
+            is_diff = _ver_summary_is_diff_row(desc)
             if is_diff:
                 df = _ver_sum_row_font_b
                 af = _ver_sum_amt_font_b
@@ -26387,8 +26529,9 @@ th {{ background:#efefef; text-align:left; }}
         """Trova l'ultima registrazione verificata (*) consecutiva dall'ultimo ** e pone ** su di essa.
 
         Vale anche per i conti carta, così resta un confine di ricerca dopo la verifica (ultima * in periodo).
-        Se in seguito si registra la girata di chiusura carta dall'app, ``_ver_place_double_star_on_cc_settlement``
-        abbassa eventuali ** precedenti a * e colloca ** sulla girata di chiusura.
+        Se in seguito si conferma la girata di chiusura in Nuove registrazioni,
+        ``apply_credit_card_settlement_verification_star`` marca solo il lato carta (non la banca)
+        e, se non ci sono buchi, colloca ``**`` sulla girata.
 
         Qualsiasi riga Movimenti-visibile senza ``*`` sullo stesso conto interrompe la catena (anche oltre
         la chiusura estratto): il ``**`` non deve avanzare oltre buchi aperti.
@@ -26510,7 +26653,12 @@ th {{ background:#efefef; text-align:left; }}
         cutoff_raw: str,
         stmt_balance: Decimal,
     ) -> tuple[dict, list[tuple[int, dict, str]], list[tuple[int, dict, str]], int, int]:
-        """Ricalcolo riepilogo verifica (stesso criterio della pagina risultati): dict stampa + liste non verificate."""
+        """Ricalcolo riepilogo verifica (stesso criterio della pagina risultati): dict stampa + liste non verificate.
+
+        Proiezione del saldo = valore non verificate + saldo estratto.
+        Differenza = Saldo Conti di casa − Proiezione. Coincidente se la differenza è 0 a centesimi.
+        Gli importi restano quelli contabili (carta: saldo estratto in genere negativo); nessuna inversione a video.
+        """
         try:
             cutoff_iso = parse_italian_ddmmyyyy_to_iso(cutoff_raw)
         except Exception:
@@ -26617,10 +26765,13 @@ th {{ background:#efefef; text-align:left; }}
         n_before_closure = len(unverified_before)
         n_after_closure = len(unverified_after)
         acc_nm = ver_account_name_var.get()
+        head = verification_report_opening_title(
+            acc_nm, is_credit_card=account_is_credit_card_by_code(d, ac)
+        )
         if count_unverified == 0:
             ver_results_title.configure(
                 text=(
-                    f"Verifica conto {acc_nm} al {cutoff_raw}. "
+                    f"{head}. Chiusura {cutoff_raw}. "
                     f"Registrazioni del conto: {count_total_touching}. "
                     f"Verifiche positive: {count_verified}."
                 )
@@ -26628,7 +26779,7 @@ th {{ background:#efefef; text-align:left; }}
         else:
             ver_results_title.configure(
                 text=(
-                    f"Registrazioni non verificate del conto {acc_nm} al {cutoff_raw}. "
+                    f"{head}. Chiusura {cutoff_raw}. "
                     f"Registrazioni del conto {count_total_touching}. "
                     f"Verifiche positive: {count_verified}. "
                     f"Non verificate: {count_unverified} "
@@ -26901,6 +27052,9 @@ th {{ background:#efefef; text-align:left; }}
         pd = ver_print_data[0] or {}
         match_ok = bool(pd.get("match_ok", False))
 
+        acc_code_print = ver_account_code_var.get().strip() or str(
+            ver_session_account_code[0] or ""
+        ).strip()
         ok = save_verifica_results_pdf(
             d,
             verifica_frame,
@@ -26911,6 +27065,7 @@ th {{ background:#efefef; text-align:left; }}
             unver_rows=unver_pdf,
             pd=pd,
             match_ok=match_ok,
+            is_credit_card=account_is_credit_card_by_code(d, acc_code_print),
         )
         if not ok:
             return
@@ -27229,6 +27384,8 @@ th {{ background:#efefef; text-align:left; }}
                     cc_draft = {
                         "ref_name": nm_ref,
                         "cc_name": nm_cc,
+                        "ref_code": str(ref_cd),
+                        "cc_code": str(acc_code),
                         "iso": d_mov.isoformat(),
                         "amount": amt_cc,
                     }
@@ -27304,6 +27461,8 @@ th {{ background:#efefef; text-align:left; }}
                 _prefill_newreg_credit_card_settlement(
                     ref_name=str(cc_draft["ref_name"]),
                     cc_name=str(cc_draft["cc_name"]),
+                    ref_code=str(cc_draft.get("ref_code") or ""),
+                    cc_code=str(cc_draft.get("cc_code") or ""),
                     movement_iso=str(cc_draft["iso"]),
                     amount=cc_draft["amount"],
                 )
