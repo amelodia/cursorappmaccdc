@@ -39,8 +39,9 @@ si applica il parser dedicato: dopo «DOTAZIONE INIZIALE» o «SALDO INIZIALE» 
 ``gg/mm/aagg/mm/aa``; si usa solo la **prima** come data
 operazione), due importi colonna **MOV.DARE** / **MOV.AVERE** (DARE → negativo, AVERE → positivo). Se nel testo c'è
 **un solo** importo (l'altra colonna a zero spesso omessa), si assume **MOV.AVERE** (entrata) salvo etichette colonna
-visibili prima della cifra (``MOV.DARE`` / ``MOV.AVERE``) e salvo causali (prelievo, addebito, commissioni…). Per i
-**bonifici** con un solo importo: ``a/in favore di`` → uscita (DARE); ``a vs favore`` / ``SEPA DA`` / ``a vostro favore``
+visibili prima della cifra (``MOV.DARE`` / ``MOV.AVERE``) e salvo causali (prelievo, addebito, commissioni, **SDD** /
+«richiesta incasso SEPA», ``Comm.`` su incasso, disposizione permanente). Per i
+**bonifici** e le **disposizioni** con un solo importo: ``a/in favore di`` → uscita (DARE); ``a vs favore`` / ``SEPA DA`` / ``a vostro favore``
 → entrata (AVERE). La **nota** è il testo dopo gli importi sulla riga del
 movimento, più le righe successive **fino** a quando non compare una nuova riga che **inizia** con la **doppia data**
 (contabile e valuta, con o senza spazio, anche ``gg/mm/aagg/mm/aa``); le date che compaiono solo dentro la nota
@@ -312,20 +313,30 @@ def _prepare_statement_lines(text: str) -> list[str]:
     return [_normalize_date_separators(_insert_space_before_glued_calendar_date(L)) for L in merged]
 
 
-def _bcc_note_bonifico_a_favore_di_terzi(desc: str) -> bool:
-    """
-    Bonifico disposto a favore di un beneficiario (uscita, colonna DARE): «a/in favore di …».
-    Non confondere con «a vs favore» (entrata sul proprio conto).
-    """
+def _bcc_note_a_favore_di_terzi(desc: str) -> bool:
+    """Uscita «a/in favore di …» (bonifico o disposizione permanente), non «a vs favore» (entrata)."""
+    if _bcc_note_bonifico_in_entrata_favore(desc):
+        return False
     u = " ".join((desc or "").split()).upper()
     ck = _compact_for_keyword(desc)
-    if "BONIFICO" not in u:
+    if "AVSFAVORE" in ck or "A VS FAVORE" in u or "A/VS FAVORE" in u:
         return False
     if "AFAVOREDI" in ck or "INFAVOREDI" in ck:
         return True
     if "A FAVORE DI" in u or "IN FAVORE DI" in u:
         return True
     return False
+
+
+def _bcc_note_bonifico_a_favore_di_terzi(desc: str) -> bool:
+    """
+    Bonifico disposto a favore di un beneficiario (uscita, colonna DARE): «a/in favore di …».
+    Non confondere con «a vs favore» (entrata sul proprio conto).
+    """
+    u = " ".join((desc or "").split()).upper()
+    if "BONIFICO" not in u:
+        return False
+    return _bcc_note_a_favore_di_terzi(desc)
 
 
 def _bcc_note_bonifico_in_entrata_favore(desc: str) -> bool:
@@ -391,7 +402,11 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
     # Emolumenti / stipendi: colonna AVERE (entrata), anche se la nota contiene «disposizione» ecc.
     if "EMOLUMENT" in u:
         return False
+    if _bcc_note_a_favore_di_terzi(note):
+        return True
     c = _compact_for_keyword(note)
+    if re.search(r"\bSDD\b", u) or c.startswith("SDD") or "SDDCORE" in c:
+        return True
     needles = (
         "PRELIEVO",
         "PAGAMENTO",
@@ -399,6 +414,7 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
         "ADEBITO",
         "COMMISSION",
         "COMMISSIONI",
+        "COMM.",
         "SPESE",
         "BOLLO",
         "IMPOSTA",
@@ -407,6 +423,9 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
         "PAGAMENT",
         "CARTA",
         "DISPOSIZION",
+        "DISPOS PERMANENTE",
+        "RICHIESTA INCASSO",
+        "INCASSO SEPA",
         "ORDIN",
         "MAV ",
         "RID ",
@@ -416,7 +435,19 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
     )
     if any(x in u for x in needles):
         return True
-    if any(x.replace(" ", "") in c for x in ("ADDEBITO", "ADEBITO", "COMMISSIONI", "DISPOSIZIONE")):
+    if any(
+        x.replace(" ", "") in c
+        for x in (
+            "ADDEBITO",
+            "ADEBITO",
+            "COMMISSIONI",
+            "DISPOSIZIONE",
+            "DISPOSPERMANENTE",
+            "RICHIESTAINCASSO",
+            "INCASSOSEPA",
+            "COMMRICHIESTA",
+        )
+    ):
         return True
     return False
 

@@ -638,6 +638,19 @@ def bind_return_and_kp_enter(widget: tk.Misc, callback: Callable[..., object], *
     widget.bind("<KP_Enter>", callback, add=add)
 
 
+def center_toplevel_on_screen(win: tk.Misc, *, min_width: int = 0) -> None:
+    """Posiziona una Toplevel al centro dello schermo (dopo aver costruito il contenuto)."""
+    try:
+        win.update_idletasks()
+        ww = max(int(win.winfo_reqwidth()), int(min_width) or 1)
+        wh = max(int(win.winfo_reqheight()), 1)
+        sw = int(win.winfo_screenwidth())
+        sh = int(win.winfo_screenheight())
+        win.geometry(f"{ww}x{wh}+{max(0, (sw - ww) // 2)}+{max(0, (sh - wh) // 2)}")
+    except Exception:
+        pass
+
+
 def bind_return_tab_and_kp_enter(widget: tk.Misc, callback: Callable[..., object], *, add: bool = False) -> None:
     """Invio/Tab chiudono l'immissione del campo ed eseguono lo stesso handler."""
     widget.bind("<Return>", callback, add=add)
@@ -3580,6 +3593,27 @@ def is_giroconto_record(rec: dict) -> bool:
     return _category_code_int(rec) == 1
 
 
+def verification_unique_booking_date_candidate(
+    candidates: list[tuple[int, dict]],
+    pdf_booking_date: str | None,
+) -> dict | None:
+    """Se tra i candidati (stesso importo) uno solo ha la data della riga estratto, quello.
+
+    Disambigua più movimenti con lo stesso importo (es. tre commissioni −0,75) quando la nota
+    del dato di verifica non coincide carattere per carattere con quella della registrazione.
+    """
+    pb = (pdf_booking_date or "").strip()
+    if not pb or not candidates:
+        return None
+    pdf_iso = parse_italian_ddmmyyyy_to_iso(pb)
+    if not pdf_iso:
+        return None
+    hits = [rec for _rn, rec in candidates if str(rec.get("date_iso") or "").strip() == pdf_iso]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
 def verification_candidate_category_display(cat_name: str, rec: dict, *, verified_side: str) -> str:
     """Categoria in griglia candidati verifica: per Girata aggiunge l'altro conto (1° o 2°).
 
@@ -6023,6 +6057,55 @@ def _open_generated_pdf_readable(path: str | Path) -> None:
     raise RuntimeError("Impossibile aprire il PDF in lettura: " + "; ".join(errs))
 
 
+def clip_text_to_measured_width(
+    text: str,
+    max_width: float,
+    width_of: Callable[[str], float],
+    *,
+    ellipsis: str = "..",
+) -> str:
+    """Tronca ``text`` affinché ``width_of(testo)`` resti ≤ ``max_width`` (ellipsis se serve)."""
+    t = text or ""
+    if not t:
+        return t
+    try:
+        if float(width_of(t)) <= float(max_width):
+            return t
+    except Exception:
+        return t
+    ell = ellipsis or ""
+    try:
+        ell_w = float(width_of(ell)) if ell else 0.0
+    except Exception:
+        return t
+    limit = float(max_width)
+    if ell_w >= limit:
+        return ell if ell_w <= limit or not ell else ""
+    lo, hi = 0, len(t)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        chunk = t[:mid] + ell
+        try:
+            ok = float(width_of(chunk)) <= limit
+        except Exception:
+            ok = False
+        if ok:
+            lo = mid
+        else:
+            hi = mid - 1
+    return (t[:lo] + ell) if lo else ell
+
+
+def _pdf_clip_text_to_width(pdf: object, text: str, width_mm: float, *, pad_mm: float = 1.4) -> str:
+    """Testo per ``cell()`` FPDF: non oltrepassa la larghezza colonna (evita sovrapposizione)."""
+    t = _pdf_safe_text(text)
+    get_w = getattr(pdf, "get_string_width", None)
+    if not callable(get_w):
+        return t
+    max_w = max(0.4, float(width_mm) - float(pad_mm))
+    return clip_text_to_measured_width(t, max_w, lambda s: float(get_w(s)))
+
+
 def _pdf_safe_text(value: object) -> str:
     """Testo sicuro per FPDF/font core (Helvetica ≈ Latin-1): evita eccezioni su simboli Unicode."""
     s = str(value if value is not None else "")
@@ -6593,12 +6676,16 @@ def save_verifica_results_pdf(
             for date_disp, amt_s, chq, note in pending_rows:
                 if pdf.get_y() > 270:
                     pdf.add_page()
-                vals = [_pdf_safe_text(date_disp), _pdf_safe_text(amt_s), _pdf_safe_text(chq)]
-                vals.append(_pdf_safe_text((note or "")[:120]))
-                vals.append(_pdf_safe_text("In sospeso"))
+                vals = [
+                    _pdf_safe_text(date_disp),
+                    _pdf_safe_text(amt_s),
+                    _pdf_safe_text(chq),
+                    _pdf_safe_text(note or ""),
+                    _pdf_safe_text("In sospeso"),
+                ]
                 for i, (v, w) in enumerate(zip(vals, pw)):
                     align = "L" if i in (3, 4) else ("R" if i == 1 else "L")
-                    pdf.cell(w, row_h, v, border=1, align=align)
+                    pdf.cell(w, row_h, _pdf_clip_text_to_width(pdf, v, w), border=1, align=align)
                 pdf.ln(row_h)
             pdf.ln(3)
         else:
@@ -6656,8 +6743,9 @@ def save_verifica_results_pdf(
                 row_src = list(tup[:8])
                 while len(row_src) < 8:
                     row_src.append("")
-                vals = [_pdf_safe_text(_ver_pdf_trunc_cell_for_column(i, row_src[i])) for i in range(8)]
-                for i, (v, w) in enumerate(zip(vals, uw_unv)):
+                for i, w in enumerate(uw_unv):
+                    raw = _pdf_safe_text(str(row_src[i] if i < len(row_src) else ""))
+                    v = _pdf_clip_text_to_width(pdf, raw, w)
                     align = "R" if i in (0, 4) else ("C" if i == 7 else "L")
                     pdf.cell(w, row_h, v, border=1, align=align)
                 pdf.ln(row_h)
@@ -23700,14 +23788,70 @@ th {{ background:#efefef; text-align:left; }}
         if idx < 0 or idx >= len(ver_pending_items[0]):
             return
         item = ver_pending_items[0][idx]
-        from tkinter import simpledialog
 
         changed_here = False
+        parent_dlg = _ver_activate_ui_for_modal_dialog()
 
-        dlg_amt = tk.Toplevel(verifica_frame)
+        def _ver_bind_modal_ok_cancel(dlg: tk.Misc, ent: tk.Misc, on_ok: Callable[..., object], on_cancel: Callable[..., object]) -> None:
+            bind_return_and_kp_enter(ent, lambda _e: (on_ok(), "break")[1])
+            bind_return_and_kp_enter(dlg, lambda _e: (on_ok(), "break")[1])
+            dlg.bind("<Escape>", lambda _e: (on_cancel(), "break")[1])
+            dlg.protocol("WM_DELETE_WINDOW", on_cancel)
+
+        def _ver_centered_text_prompt(*, title: str, prompt: str, initial: str, max_len: int) -> str | None:
+            dlg = tk.Toplevel(parent_dlg)
+            dlg.title(title)
+            dlg.resizable(False, False)
+            try:
+                dlg.transient(parent_dlg)
+            except Exception:
+                pass
+            result: list[str | None] = [None]
+            done = [False]
+            fr = ttk.Frame(dlg, padding=12)
+            fr.pack(fill=tk.BOTH, expand=True)
+            ttk.Label(fr, text=prompt, justify=tk.LEFT).pack(anchor=tk.W)
+            v = tk.StringVar(value=initial)
+            ent = ttk.Entry(fr, textvariable=v, width=52, style="NewReg.TEntry")
+            ent.pack(anchor=tk.W, pady=(8, 0), fill=tk.X)
+            bind_limited_single_line_text_entry(ent, v, max_len=max_len, strip_edges=False)
+
+            def _ok(*_a: object) -> None:
+                if done[0]:
+                    return
+                done[0] = True
+                result[0] = v.get()
+                dlg.destroy()
+
+            def _cancel(*_a: object) -> None:
+                if done[0]:
+                    return
+                done[0] = True
+                result[0] = None
+                dlg.destroy()
+
+            bf = ttk.Frame(fr)
+            bf.pack(pady=(12, 0))
+            ttk.Button(bf, text="Annulla", command=_cancel).pack(side=tk.LEFT, padx=(0, 8))
+            ttk.Button(bf, text="Conferma", command=_ok).pack(side=tk.LEFT)
+            _ver_bind_modal_ok_cancel(dlg, ent, _ok, _cancel)
+            try:
+                center_toplevel_on_screen(dlg)
+                dlg.grab_set()
+                ent.focus_set()
+                try:
+                    ent.icursor(tk.END)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            dlg.wait_window()
+            return result[0]
+
+        dlg_amt = tk.Toplevel(parent_dlg)
         dlg_amt.title("Modifica importo")
         try:
-            dlg_amt.transient(verifica_frame.winfo_toplevel())
+            dlg_amt.transient(parent_dlg)
         except Exception:
             try:
                 dlg_amt.transient(verifica_frame)
@@ -23727,22 +23871,16 @@ th {{ background:#efefef; text-align:left; }}
         v_amt = tk.StringVar(value=str(item.get("amount") or ""))
         ent_amt = _euro_amount_entry(fr_amt, v_amt, width=22, style="NewReg.TEntry")
         ent_amt.pack(anchor=tk.W, pady=(8, 0))
-        bind_euro_amount_entry_validation(
-            ent_amt,
-            v_amt,
-            allow_leading_sign=True,
-            require_leading_sign=True,
-            reject_zero=True,
-            cursor_after_sign_on_focus=True,
-            external_focusout=True,
-        )
         err_amt = tk.StringVar(value="")
         tk.Label(fr_amt, textvariable=err_amt, fg="#c62828", font=("TkDefaultFont", 10)).pack(anchor=tk.W, pady=(4, 0))
         bf_amt = ttk.Frame(fr_amt)
         bf_amt.pack(pady=(12, 0))
         amt_result: list[bool | None] = [None]
+        amt_done = [False]
 
-        def _amt_ok() -> None:
+        def _amt_ok(*_a: object) -> None:
+            if amt_done[0]:
+                return
             raw = (v_amt.get() or "").strip()
             if not raw or raw in ("+", "-"):
                 err_amt.set("Importo obbligatorio.")
@@ -23755,20 +23893,33 @@ th {{ background:#efefef; text-align:left; }}
             if dec == Decimal("0.00"):
                 err_amt.set("Importo a zero non ammesso.")
                 return
+            amt_done[0] = True
             item["amount"] = _ver_amount_storage_str(dec)
             amt_result[0] = True
             dlg_amt.destroy()
 
-        def _amt_cancel() -> None:
+        def _amt_cancel(*_a: object) -> None:
+            if amt_done[0]:
+                return
+            amt_done[0] = True
             amt_result[0] = False
             dlg_amt.destroy()
 
         ttk.Button(bf_amt, text="Annulla", command=_amt_cancel).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(bf_amt, text="Conferma", command=_amt_ok).pack(side=tk.LEFT)
-        bind_return_and_kp_enter(ent_amt, _amt_ok)
+        bind_euro_amount_entry_validation(
+            ent_amt,
+            v_amt,
+            allow_leading_sign=True,
+            require_leading_sign=True,
+            reject_zero=True,
+            cursor_after_sign_on_focus=True,
+            external_focusout=True,
+            on_enter=_amt_ok,
+        )
+        _ver_bind_modal_ok_cancel(dlg_amt, ent_amt, _amt_ok, _amt_cancel)
         try:
-            _ver_activate_ui_for_modal_dialog()
-            dlg_amt.update_idletasks()
+            center_toplevel_on_screen(dlg_amt)
             dlg_amt.grab_set()
             ent_amt.focus_set()
         except Exception:
@@ -23777,20 +23928,20 @@ th {{ background:#efefef; text-align:left; }}
         if amt_result[0] is True:
             changed_here = True
 
-        new_chq = simpledialog.askstring(
-            "Modifica assegno",
-            f"Assegno attuale: {item.get('cheque', '')}",
-            initialvalue=item.get("cheque", ""),
-            parent=verifica_frame,
+        new_chq = _ver_centered_text_prompt(
+            title="Modifica assegno",
+            prompt=f"Assegno attuale: {item.get('cheque', '')}",
+            initial=str(item.get("cheque") or ""),
+            max_len=MAX_CHEQUE_LEN,
         )
         if new_chq is not None:
             item["cheque"] = sanitize_single_line_text(new_chq or "", max_len=MAX_CHEQUE_LEN, strip_edges=False)
             changed_here = True
-        new_note = simpledialog.askstring(
-            "Modifica nota",
-            f"Nota attuale: {item.get('note', '')}",
-            initialvalue=item.get("note", ""),
-            parent=verifica_frame,
+        new_note = _ver_centered_text_prompt(
+            title="Modifica nota",
+            prompt=f"Nota attuale: {item.get('note', '')}",
+            initial=str(item.get("note") or ""),
+            max_len=MAX_RECORD_NOTE_LEN,
         )
         if new_note is not None:
             item["note"] = sanitize_single_line_text(new_note or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
@@ -24711,19 +24862,21 @@ th {{ background:#efefef; text-align:left; }}
         Restituisce:
           ('exact', rec, [])  se trovato match importo e (assegno o nota **identici** carattere per
             carattere dopo normalizzazione, con contenuto non vuoto su entrambi i lati), oppure
-            con ``pdf_assisted=True`` se tra i candidati con lo stesso importo **uno solo** ha la
-            data contabile uguale alla data operazione della riga PDF;
+            se ``pdf_booking_date`` è nota e tra i candidati con lo stesso importo **uno solo** ha
+            la data contabile uguale a quella data (anche a coda PDF già terminata);
           ('contains', rec, candidates)  se match parziale su assegno/nota (utile per griglia e ordinamento;
-            con ``pdf_assisted`` l'abbinamento automatico resta comunque limitato a exact sopra o importo+data);
+            l'abbinamento automatico resta comunque limitato a exact sopra o importo+data);
           ('candidates', None, candidates)  se stesso importo ma senza altro campo identico
             (sempre verifica manuale a scelta dalla lista);
           ('none', None, [])  se nessun match
 
-        Non si considera mai ``exact`` solo per uguaglianza di importo in verifica manuale; con PDF,
-        l'auto-match per **importo + data** richiede un solo candidato con quella coppia. Senza
-        quello né assegno/nota identici serve la griglia candidati o i sospesi.
+        Non si considera mai ``exact`` solo per uguaglianza di importo in verifica manuale; con
+        data operazione nota, l'auto-match per **importo + data** richiede un solo candidato con
+        quella coppia. Senza quello né assegno/nota identici serve la griglia candidati o i sospesi.
         Con ``pdf_booking_date``, i candidati con lo stesso importo sono ordinati per
         vicinanza temporale e sovrapposizione lessicale sulle note.
+        ``pdf_assisted`` resta per i chiamanti (coda PDF attiva); l'exact importo+data usa la
+        data se presente, indipendentemente da quella flag.
         """
         ac = str(acc_code or "").strip()
         if not ac:
@@ -24796,14 +24949,9 @@ th {{ background:#efefef; text-align:left; }}
                 verify_note=note_text,
             )
 
-        if pdf_assisted:
-            same_amt_and_date = [
-                (rn, r)
-                for rn, r in candidates
-                if _ver_pdf_booking_date_matches_rec_date(r, pdf_booking_date)
-            ]
-            if len(same_amt_and_date) == 1:
-                return ("exact", same_amt_and_date[0][1], [])
+        picked_by_date = verification_unique_booking_date_candidate(candidates, pdf_booking_date)
+        if picked_by_date is not None:
+            return ("exact", picked_by_date, [])
         if contains_hit is not None:
             return ("contains", contains_hit[1], candidates)
         if candidates:
@@ -25976,7 +26124,7 @@ th {{ background:#efefef; text-align:left; }}
             amt,
             chq,
             note,
-            pdf_assisted=pdf_assisted,
+            pdf_assisted=pdf_assisted or bool(bd_raw),
             pdf_booking_date=bd_raw or None,
         )
         declined_pick = bool(item.get("declined_candidate_pick"))
@@ -27080,9 +27228,8 @@ th {{ background:#efefef; text-align:left; }}
         """Riesegue la verifica su ogni sospeso. Ritorna il numero di match riusciti."""
         acc_code = ver_account_code_var.get()
         matched = 0
-        # Con coda PDF ancora attiva, stesse regole «assistite» della riga corrente; dopo fine coda le voci
-        # possono avere booking_date salvato ma la riconciliazione va come verifica manuale (contains / candidati),
-        # altrimenti il match data+importo resterebbe troppo rigido per registrazioni inserite a posteriori.
+        # Data operazione sul sospeso: disambigua importi ripetuti (es. tre −0,75) anche a coda PDF
+        # già vuota. Senza data coincidente resta il fallback «un solo candidato con quell'importo».
         q_pdf = ver_bancoposta_queue[0]
         pdf_session_active = bool(q_pdf) and len(q_pdf) > 0
         for item in list(ver_pending_items[0]):
@@ -27101,8 +27248,8 @@ th {{ background:#efefef; text-align:left; }}
                 amt,
                 chq,
                 note,
-                pdf_assisted=pdf_assisted_retry,
-                pdf_booking_date=(bd_raw or None) if pdf_assisted_retry else None,
+                pdf_assisted=pdf_assisted_retry or bool(bd_raw),
+                pdf_booking_date=bd_raw or None,
             )
             verify_rec: dict | None = None
             if result_type == "exact" and matched_rec is not None:
@@ -27112,6 +27259,8 @@ th {{ background:#efefef; text-align:left; }}
                 verify_rec = candidates[0][1]
             elif result_type == "contains" and matched_rec is not None and len(candidates) == 1:
                 verify_rec = matched_rec
+            if verify_rec is None:
+                verify_rec = verification_unique_booking_date_candidate(candidates, bd_raw)
             if verify_rec is not None:
                 _touches, side = _ver_record_touches_account(verify_rec, acc_code)
                 _ver_mark_record_verified(verify_rec, side)
