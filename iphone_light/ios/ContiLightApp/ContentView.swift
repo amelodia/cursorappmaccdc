@@ -109,6 +109,8 @@ struct ContentView: View {
     @State private var lastScenePhaseRefreshAt: Date = .distantPast
     /// Se l’app va in background a metà salvataggio, chiudi la sessione solo a scrittura completata.
     @State private var closeSessionWhenPersistEnds = false
+    /// Registrazioni tenute in memoria: un solo aggiornamento di ``*_light.enc`` all’uscita, non uno per riga.
+    @State private var lightDropboxDirty = false
     /// Evict + riscaricamento `*_light.enc` da Dropbox/Files (login e tasto Allinea).
     @State private var isAligningCloud = false
 
@@ -139,9 +141,7 @@ struct ContentView: View {
                         email: email,
                         password: password,
                         onPersisted: { updatedDb, _, note in
-                            loggedInSessionDb = updatedDb as NSDictionary
-                            loggedInRecords = ContiDatabase.displayRecords(from: updatedDb, sort: movimentiListSort)
-                            message = note
+                            rememberSessionForDropboxFlush(updatedDb, note: note)
                         }
                     )
                 case .modifica(let legacyKey):
@@ -153,9 +153,7 @@ struct ContentView: View {
                         email: email,
                         password: password,
                         onPersisted: { updatedDb, _, note in
-                            loggedInSessionDb = updatedDb as NSDictionary
-                            loggedInRecords = ContiDatabase.displayRecords(from: updatedDb, sort: movimentiListSort)
-                            message = note
+                            rememberSessionForDropboxFlush(updatedDb, note: note)
                         },
                         editingLegacyKey: legacyKey
                     )
@@ -189,21 +187,17 @@ struct ContentView: View {
                     }
                 }
             } else if phase == .background {
-                // Non interrompere la scrittura del *_light.enc: background task + chiusura sessione solo a fine persist.
-                if ContiDatabase.isPersistInProgress {
-                    closeSessionWhenPersistEnds = true
-                    Task { @MainActor in
-                        while ContiDatabase.isPersistInProgress {
-                            try? await Task.sleep(nanoseconds: 200_000_000)
-                        }
-                        if closeSessionWhenPersistEnds {
-                            closeSessionWhenPersistEnds = false
-                            closeCurrentSessionAndReleaseLock()
-                        }
+                // Una sola scrittura Dropbox per tutte le registrazioni della sessione, poi chiusura.
+                closeSessionWhenPersistEnds = true
+                Task { @MainActor in
+                    await flushLightSessionToDropboxIfDirty()
+                    while ContiDatabase.isPersistInProgress {
+                        try? await Task.sleep(nanoseconds: 200_000_000)
                     }
-                } else {
-                    closeSessionWhenPersistEnds = false
-                    closeCurrentSessionAndReleaseLock()
+                    if closeSessionWhenPersistEnds {
+                        closeSessionWhenPersistEnds = false
+                        closeCurrentSessionAndReleaseLock()
+                    }
                 }
             }
         }
@@ -1058,12 +1052,73 @@ struct ContentView: View {
 
     private func closeCurrentSessionAndReleaseLock() {
         releaseSessionLockIfOwned()
+        lightDropboxDirty = false
         loggedInSessionDb = nil
         loggedInRecords = []
         movimentiDisplayName = ""
         sessionKeyURL = nil
         sessionLightEncURL = nil
         movimentiPath = NavigationPath()
+    }
+
+    /// Tiene la sessione in memoria e ne fa una copia cifrata fuori da Dropbox.
+    private func rememberSessionForDropboxFlush(_ db: [String: Any], note: String) {
+        loggedInSessionDb = db as NSDictionary
+        loggedInRecords = ContiDatabase.displayRecords(from: db, sort: movimentiListSort)
+        lightDropboxDirty = true
+        message = note
+        guard let folder = dataFolderURL, let key = sessionKeyURL else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let access = folder.startAccessingSecurityScopedResource()
+            defer {
+                if access { folder.stopAccessingSecurityScopedResource() }
+            }
+            guard access else { return }
+            try? ContiDatabase.savePendingLightSession(db: db, keyURL: key)
+        }
+    }
+
+    /// Scrive ``*_light.enc`` una sola volta, con tutte le registrazioni della sessione.
+    private func flushLightSessionToDropboxIfDirty() async {
+        guard lightDropboxDirty,
+              let db = loggedInSessionDb as? [String: Any],
+              let folder = dataFolderURL,
+              let key = sessionKeyURL,
+              let enc = sessionLightEncURL else { return }
+        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        let generationAtStart = ContiDatabase.pendingLightGenerationNow()
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let access = folder.startAccessingSecurityScopedResource()
+                defer {
+                    if access { folder.stopAccessingSecurityScopedResource() }
+                }
+                var wrote = false
+                if access {
+                    do {
+                        _ = try ContiDatabase.persistSessionDbToEncryptedFiles(
+                            sessionDb: db,
+                            recordForSaldi: [:],
+                            lightEncURL: enc,
+                            keyURL: key,
+                            email: emailTrim,
+                            password: passwordTrim
+                        )
+                        ContiDatabase.removePendingLightSession(ifGeneration: generationAtStart)
+                        wrote = true
+                    } catch {
+                        wrote = false
+                    }
+                }
+                DispatchQueue.main.async {
+                    if wrote, ContiDatabase.pendingLightGenerationNow() == generationAtStart {
+                        self.lightDropboxDirty = false
+                    }
+                    cont.resume()
+                }
+            }
+        }
     }
 
     /// Carica e decifra il DB in background (come `loginWithPassword`).
@@ -1184,6 +1239,15 @@ struct ContentView: View {
                 let syncWaitNote: String = totalWait >= 1.0
                     ? String(format: "Attesa sincronizzazione Dropbox: %.1fs.", totalWait)
                     : ""
+                var pendingFlushNote = ""
+                if ContiDatabase.pendingLightSessionExists() {
+                    do {
+                        try ContiDatabase.writePendingLightSessionIfPresent(to: encRef)
+                        pendingFlushNote = "Scritte su Dropbox le registrazioni rimaste in sospeso dalla sessione precedente."
+                    } catch {
+                        pendingFlushNote = "Ci sono registrazioni locali non ancora scritte su Dropbox: \(error.localizedDescription)"
+                    }
+                }
 
                 do {
                     let encData = try ContiDatabase.coordinatedDataContents(of: encRef)
@@ -1221,6 +1285,7 @@ struct ContentView: View {
                             : "Accesso effettuato."
                         var notes: [String] = []
                         if !syncWaitNote.isEmpty { notes.append(syncWaitNote) }
+                        if !pendingFlushNote.isEmpty { notes.append(pendingFlushNote) }
                         let msgOut = notes.isEmpty ? baseMsg : baseMsg + "\n\n" + notes.joined(separator: "\n")
                         packet = LoginResultPacket(
                             message: msgOut,

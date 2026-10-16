@@ -995,18 +995,13 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         if girataSelected, !a2.isEmpty, a2 != "—" { lines[0] += ", \(a2)" }
         lines.append("Importo (JSON): \(amt) EUR")
         lines.append(
-            isEditMode
-                ? "Le modifiche saranno scritte nel file light (*_light.enc) nella cartella dati. Il completo si aggiorna sul desktop."
-                : "La registrazione sarà scritta nel file light (*_light.enc) nella cartella dati. Il completo si aggiorna sul desktop."
-        )
-        lines.append(
-            "AVVISO: durante il salvataggio l’app resta bloccata — non chiuderla e non bloccare lo schermo finché non compare la conferma."
+            "La registrazione resta in questa sessione. Il file light su Dropbox si aggiorna una sola volta quando esci dall’app. Il completo si aggiorna sul desktop."
         )
         return lines.joined(separator: "\n")
     }
 
     private func performSave() {
-        guard let db = sessionDb, let folder = dataFolderURL, let k = keyURL, let e = lightEncURL else {
+        guard let db = sessionDb, let folder = dataFolderURL, keyURL != nil, lightEncURL != nil else {
             errorAlertMessage = "Percorsi di salvataggio non disponibili."
             showErrorAlert = true
             return
@@ -1014,8 +1009,6 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(pickedDate))
         let rid = pendingLightRecordId.isEmpty ? UUID().uuidString : pendingLightRecordId
         pendingLightRecordId = rid
-        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
         let optEdit = editingLegacyKey
         let isNewForm = (optEdit == nil)
         isSaving = true
@@ -1052,15 +1045,12 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     } else {
                         _ = try ContiDatabase.appendLightSessionRecord(db: &working, recordTemplate: tpl)
                     }
-                    let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
-                        sessionDb: working,
-                        recordForSaldi: tpl,
-                        lightEncURL: e,
-                        keyURL: k,
-                        email: emailTrim,
-                        password: passwordTrim
-                    )
-                    return .success((out.sessionLight, out.note))
+                    ContiDatabase.recomputeLightSaldiFromFullDb(&working)
+                    let note = """
+                    Registrazione memorizzata. Il file light su Dropbox viene aggiornato una sola volta quando esci dall’app. \
+                    Il database completo si aggiorna all’avvio dell’app desktop.
+                    """
+                    return .success((working, note))
                 } catch {
                     return .failure(error)
                 }
@@ -1091,13 +1081,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     }
 
     private func performDeleteRecord() {
-        guard let db = sessionDb, let folder = dataFolderURL, let k = keyURL, let e = lightEncURL, let lk = editingLegacyKey else {
+        guard let db = sessionDb, let folder = dataFolderURL, keyURL != nil, lightEncURL != nil, let lk = editingLegacyKey else {
             errorAlertMessage = "Operazione non disponibile."
             showErrorAlert = true
             return
         }
-        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
         isSaving = true
         DispatchQueue.global(qos: .userInitiated).async {
             let access = folder.startAccessingSecurityScopedResource()
@@ -1113,16 +1101,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 do {
                     var working = try ContiDatabase.deepCopyDb(db)
                     try ContiDatabase.setSessionRecordCancelled(db: &working, legacyKey: lk, isCancelled: true)
-                    let saldiPlaceholder: [String: Any] = ["is_cancelled": true]
-                    let out = try ContiDatabase.persistSessionDbToEncryptedFiles(
-                        sessionDb: working,
-                        recordForSaldi: saldiPlaceholder,
-                        lightEncURL: e,
-                        keyURL: k,
-                        email: emailTrim,
-                        password: passwordTrim
-                    )
-                    return .success((out.sessionLight, out.note))
+                    ContiDatabase.recomputeLightSaldiFromFullDb(&working)
+                    let note = """
+                    Registrazione annullata in questa sessione. Il file light su Dropbox viene aggiornato una sola volta quando esci dall’app.
+                    """
+                    return .success((working, note))
                 } catch {
                     return .failure(error)
                 }

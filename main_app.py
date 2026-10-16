@@ -9405,24 +9405,72 @@ def user_local_backup_light_path(primary_enc: Path) -> Path:
     return _user_library_conti_support_dir() / f"{lp.stem}_backup.enc"
 
 
+def _is_light_sidecar_backup_name(path: Path) -> bool:
+    """True per ``<stem>_light_backup.enc``: estratto degli ultimi 365 giorni, non il database completo."""
+    return path.name.lower().endswith("_light_backup.enc")
+
+
+def _db_dict_is_light_sidecar(db: dict | None) -> bool:
+    """Il sidecar light porta ``light_sidecar_generated_at`` e non contiene gli anni precedenti alla finestra."""
+    if not isinstance(db, dict):
+        return False
+    return bool(str(db.get("light_sidecar_generated_at") or "").strip())
+
+
 def _discover_library_backup_enc_files() -> list[Path]:
-    """File ``*_backup.enc`` in Library, più recente per primo."""
+    """Backup del database completo in Library, più recente per primo.
+
+    Esclude ``*_light_backup.enc``: viene scritto dopo il completo e, se scelto come «più recente»,
+    il ripristino apre solo la finestra mobile (mancano le registrazioni vecchie, legacy comprese).
+    """
     d = _user_library_conti_support_dir()
     if not d.is_dir():
         return []
-    out = [p for p in d.glob("*_backup.enc") if p.is_file()]
+    out = [
+        p
+        for p in d.glob("*_backup.enc")
+        if p.is_file() and not _is_light_sidecar_backup_name(p)
+    ]
     out.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return out
 
 
+def _ordered_library_full_db_backups() -> list[Path]:
+    """Backup completi: prima quello dell’ultima email di accesso, poi gli altri per data."""
+    files = _discover_library_backup_enc_files()
+    preferred_name = ""
+    email = data_workspace.load_last_login_email()
+    if email:
+        try:
+            preferred_name = user_local_backup_enc_path(per_user_encrypted_db_path(email)).name
+        except Exception:
+            preferred_name = ""
+
+    def _key(p: Path) -> tuple[int, float]:
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            mt = 0.0
+        preferred = 0 if preferred_name and p.name == preferred_name else 1
+        return (preferred, -mt)
+
+    files.sort(key=_key)
+    return files
+
+
 def primary_enc_path_from_library_backup_filename(backup_path: Path) -> Path | None:
-    """Da ``conti_utente_XXX_backup.enc`` → cartella dati ``conti_utente_XXX.enc``."""
+    """Da ``conti_utente_XXX_backup.enc`` → cartella dati ``conti_utente_XXX.enc``.
+
+    ``*_light_backup.enc`` non è un database completo: non viene mappato su un file operativo.
+    """
+    if _is_light_sidecar_backup_name(backup_path):
+        return None
     stem = backup_path.stem
     suf = "_backup"
     if not stem.endswith(suf):
         return None
     primary_stem = stem[: -len(suf)]
-    if not primary_stem:
+    if not primary_stem or primary_stem.endswith("_light"):
         return None
     return data_workspace.data_dir() / f"{primary_stem}.enc"
 
@@ -9494,19 +9542,30 @@ def _try_restore_database_from_library_at_startup(
         return None
     if _try_load_first_valid_user_db(key_path=key_path) is not None:
         return None
-    backups = [p for p in _discover_library_backup_enc_files() if _enc_file_has_payload(p)]
-    if not backups:
-        return None
-    chosen = backups[0]
-    primary_target = primary_enc_path_from_library_backup_filename(chosen)
-    if primary_target is None:
+    backups = [p for p in _ordered_library_full_db_backups() if _enc_file_has_payload(p)]
+    chosen: Path | None = None
+    primary_target: Path | None = None
+    for candidate in backups:
+        target = primary_enc_path_from_library_backup_filename(candidate)
+        if target is None:
+            continue
+        try:
+            probe = load_encrypted_db(candidate, key_path)
+        except (InvalidToken, OSError, json.JSONDecodeError, ValueError):
+            probe = None
+        if probe is None or _db_dict_is_light_sidecar(probe):
+            continue
+        chosen = candidate
+        primary_target = target
+        break
+    if chosen is None or primary_target is None:
         return None
     parent = sync_ui_parent
     extra = ""
     if len(backups) > 1:
         extra = (
-            f"\n\nAltri backup nella Library: {len(backups) - 1}. "
-            "Verrà usato il più recente; da Opzioni puoi ripristinare un file specifico."
+            f"\n\nAltri backup del database completo nella Library: {len(backups) - 1}. "
+            "Verrà usato il backup completo dell’utente (non il file light degli ultimi 365 giorni)."
         )
     msg = (
         "Il database operativo non è stato trovato nella cartella dati "

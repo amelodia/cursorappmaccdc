@@ -555,6 +555,8 @@ nonisolated public enum ContiDatabase {
     private static var sessionHoldsDataFolderMarkerOnDisk = false
     /// Contatore persist `.enc` in corso (thread-safe). Usato per non chiudere la sessione in background a metà scrittura.
     private static var activePersistCount = 0
+    /// Aumenta a ogni copia locale della sessione, così una scrittura Dropbox non cancella una registrazione più nuova.
+    private static var pendingLightGeneration = 0
 
     /// `true` mentre Conti Light sta scrivendo il `*_light.enc` (o altro persist esplicito).
     public static var isPersistInProgress: Bool {
@@ -2797,8 +2799,9 @@ nonisolated public enum ContiDatabase {
         try writeDataPreservingCloudIdentity(outData, to: encURL)
     }
 
-    /// Fuori da Dropbox: scrittura atomica classica. Su Dropbox/File Provider: coordinator + overwrite in-place
-    /// (stesso file, niente `.tmp` nella cartella sincronizzata).
+    /// Fuori da Dropbox: scrittura atomica classica. Su Dropbox/File Provider: overwrite **in-place**.
+    /// ``.forReplacing`` e ``replaceItemAt`` danno al file una identità nuova: Dropbox tiene la versione
+    /// precedente come conflicted copy, una per ogni salvataggio.
     private static func writeDataPreservingCloudIdentity(_ data: Data, to destURL: URL) throws {
         if !pathLooksUnderDropbox(destURL) {
             try data.write(to: destURL, options: .atomic)
@@ -2809,37 +2812,11 @@ nonisolated public enum ContiDatabase {
         var writeError: Error?
         coordinator.coordinate(
             writingItemAt: destURL,
-            options: [.forReplacing],
+            options: [],
             error: &coordinatorError
         ) { writeURL in
             do {
-                let fm = FileManager.default
-                if fm.fileExists(atPath: writeURL.path) {
-                    do {
-                        let handle = try FileHandle(forWritingTo: writeURL)
-                        defer { try? handle.close() }
-                        try handle.seek(toOffset: 0)
-                        try handle.write(contentsOf: data)
-                        try handle.truncate(atOffset: UInt64(data.count))
-                        try handle.synchronize()
-                    } catch {
-                        // Fallback: tmp **fuori** da Dropbox + replaceItemAt (identità del documento).
-                        let tmp = fm.temporaryDirectory.appendingPathComponent(
-                            "conti-light-\(UUID().uuidString).tmp",
-                            isDirectory: false
-                        )
-                        try data.write(to: tmp, options: .atomic)
-                        defer { try? fm.removeItem(at: tmp) }
-                        _ = try fm.replaceItemAt(
-                            writeURL,
-                            withItemAt: tmp,
-                            backupItemName: nil,
-                            options: []
-                        )
-                    }
-                } else {
-                    try data.write(to: writeURL, options: [])
-                }
+                try writeBytesInPlace(data, to: writeURL)
             } catch {
                 writeError = error
             }
@@ -2850,6 +2827,84 @@ nonisolated public enum ContiDatabase {
         if let writeError {
             throw writeError
         }
+    }
+
+    /// Sovrascrive i byte del file esistente. Non usa ``replaceItemAt``: quel replace è la conflicted copy.
+    private static func writeBytesInPlace(_ data: Data, to writeURL: URL) throws {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: writeURL.path) {
+            try data.write(to: writeURL, options: [])
+            return
+        }
+        do {
+            let handle = try FileHandle(forWritingTo: writeURL)
+            defer { try? handle.close() }
+            try handle.seek(toOffset: 0)
+            try handle.write(contentsOf: data)
+            try handle.truncate(atOffset: UInt64(data.count))
+            try handle.synchronize()
+        } catch {
+            try data.write(to: writeURL, options: [])
+        }
+    }
+
+    /// Copia cifrata della sessione **fuori** da Dropbox. Ogni registrazione la aggiorna subito;
+    /// il ``*_light.enc`` nella cartella dati si scrive una sola volta all’uscita (o al prossimo accesso).
+    public static func pendingLightSessionEncURL() -> URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("ContiLight", isDirectory: true)
+        return base.appendingPathComponent("pending_light_session.enc", isDirectory: false)
+    }
+
+    public static func pendingLightSessionExists() -> Bool {
+        FileManager.default.fileExists(atPath: pendingLightSessionEncURL().path)
+    }
+
+    /// Generazione della copia locale. La scrittura Dropbox cancella il file solo se nel frattempo non è arrivata un’altra registrazione.
+    public static func savePendingLightSession(db: [String: Any], keyURL: URL) throws -> Int {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        pendingLightGeneration += 1
+        let generation = pendingLightGeneration
+        let keyString = try coordinatedStringContents(of: keyURL, encoding: .utf8)
+        try writeFernetEncryptedDb(db: db, encURL: pendingLightSessionEncURL(), keyString: keyString)
+        return generation
+    }
+
+    public static func pendingLightGenerationNow() -> Int {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        return pendingLightGeneration
+    }
+
+    public static func removePendingLightSession(ifGeneration generation: Int) {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        guard generation == pendingLightGeneration else { return }
+        try? FileManager.default.removeItem(at: pendingLightSessionEncURL())
+    }
+
+    /// Se l’app è stata chiusa prima della scrittura Dropbox, riversa la copia locale sul ``*_light.enc``.
+    public static func writePendingLightSessionIfPresent(to lightEncURL: URL) throws {
+        localInstanceMutex.lock()
+        let pending = pendingLightSessionEncURL()
+        let generation = pendingLightGeneration
+        let data: Data?
+        do {
+            if FileManager.default.fileExists(atPath: pending.path) {
+                data = try Data(contentsOf: pending)
+            } else {
+                data = nil
+            }
+        } catch {
+            localInstanceMutex.unlock()
+            throw error
+        }
+        localInstanceMutex.unlock()
+        guard let data else { return }
+        try assertSafeToSave(lightEncURL)
+        try writeDataPreservingCloudIdentity(data, to: lightEncURL)
+        removePendingLightSession(ifGeneration: generation)
     }
 
     /// Scrive un database cifrato (stesso formato del desktop). Usato da Conti Light solo per ``*_light.enc``.
