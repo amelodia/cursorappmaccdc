@@ -38,9 +38,12 @@ Se in testata compaiono **DARE** / **AVERE** senza colonne spaziate, si usa lo s
 si applica il parser dedicato: dopo «DOTAZIONE INIZIALE» o «SALDO INIZIALE» due date ``gg/mm/aa`` (anche **attaccate**
 ``gg/mm/aagg/mm/aa``; si usa solo la **prima** come data
 operazione), due importi colonna **MOV.DARE** / **MOV.AVERE** (DARE → negativo, AVERE → positivo). Se nel testo c'è
-**un solo** importo (l'altra colonna a zero spesso omessa), si assume **MOV.AVERE** (entrata) salvo etichette colonna
-visibili prima della cifra (``MOV.DARE`` / ``MOV.AVERE``) e salvo causali (prelievo, addebito, commissioni, **SDD** /
-«richiesta incasso SEPA», ``Comm.`` su incasso, disposizione permanente). Per i
+**un solo** importo (l'altra colonna a zero spesso omessa) e l'estrazione ``layout`` conserva gli spazi di colonna,
+il segno segue la **posizione** dell'importo (sotto ``MOV.DARE`` → negativo, sotto ``MOV.AVERE`` → positivo): così
+«Interessi e competenze» / ``Liq.comp.`` in Dare non diventa un'entrata. Senza posizione utile si assume
+**MOV.AVERE** (entrata) salvo etichette colonna visibili prima della cifra (``MOV.DARE`` / ``MOV.AVERE``) e salvo
+causali (prelievo, addebito, commissioni, **SDD** / «richiesta incasso SEPA», ``Comm.`` su incasso, disposizione
+permanente, interessi e competenze). Per i
 **bonifici** e le **disposizioni** con un solo importo: ``a/in favore di`` → uscita (DARE); ``a vs favore`` / ``SEPA DA`` / ``a vostro favore``
 → entrata (AVERE). La **nota** è il testo dopo gli importi sulla riga del
 movimento, più le righe successive **fino** a quando non compare una nuova riga che **inizia** con la **doppia data**
@@ -432,6 +435,10 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
         "CBILL",
         "PAGO PA",
         "PAGOPA",
+        # Liquidazione trimestrale BCC: in Dare se la colonna non è leggibile dal layout.
+        "INTERESSI E COMPETENZE",
+        "LIQ.COMP",
+        "LIQUIDAZIONE COMPETENZE",
     )
     if any(x in u for x in needles):
         return True
@@ -446,6 +453,9 @@ def _bcc_note_suggests_dare_outflow(note: str) -> bool:
             "RICHIESTAINCASSO",
             "INCASSOSEPA",
             "COMMRICHIESTA",
+            "INTERESSIECOMPETENZE",
+            "LIQ.COMP",
+            "LIQUIDAZIONECOMPETENZE",
         )
     ):
         return True
@@ -989,7 +999,7 @@ def _bcc_build_movement_from_tail(
     max_note_len: int,
 ) -> tuple[dict[str, object] | None, str | None]:
     """
-    Dopo le due date: MOV.DARE / MOV.AVERE; un solo importo → di norma MOV.AVERE salvo causale da uscita.
+    Dopo le due date: MOV.DARE / MOV.AVERE; un solo importo → di norma MOV.AVERE salvo etichetta di colonna o causale da uscita.
     Se sulla stessa riga segue un altro movimento (doppia data attaccata), il secondo elemento è il suffisso da riparsare.
     """
     tail = (tail or "").strip()
@@ -1631,6 +1641,53 @@ def _amex_next_line_is_foreign_currency_label(line: str) -> bool:
     return u.startswith("DOLLARI STATUNITENSI")
 
 
+_RE_BCC_LAYOUT_HEADER_DARE_AVERE = re.compile(r"MOV\.DARE\s{2,}MOV\.AVERE", re.I)
+_RE_BCC_LAYOUT_MOVEMENT_LINE = re.compile(r"^\s*\d{2}/\d{2}/\d{2}\s+\d{2}/\d{2}/\d{2}\b")
+
+
+def _bcc_stamp_layout_dare_avere_labels(text: str) -> str:
+    """
+    Se il testo ``layout`` allinea ``MOV.DARE`` e ``MOV.AVERE``, marca ogni importo di movimento
+    con l'etichetta della colonna più vicina (bordo destro della cifra rispetto al bordo delle etichette).
+
+    Il parser successivo collassa gli spazi: l'etichetta resta subito prima della cifra e fissa il segno
+    anche quando l'altra colonna è vuota. Il plain, con un solo spazio tra le etichette, non viene marcato.
+    """
+    if not text or not _RE_BCC_LAYOUT_HEADER_DARE_AVERE.search(text):
+        return text
+    dare_end: int | None = None
+    avere_end: int | None = None
+    out: list[str] = []
+    for line in text.splitlines():
+        header = _RE_BCC_LAYOUT_HEADER_DARE_AVERE.search(line)
+        if header:
+            dare_end = header.start() + len("MOV.DARE")
+            avere_end = header.end()
+            out.append(line)
+            continue
+        if dare_end is None or avere_end is None or not _RE_BCC_LAYOUT_MOVEMENT_LINE.match(line):
+            out.append(line)
+            continue
+        amounts = list(re.finditer(rf"(?<![0-9,])({_AMT_CORE})(?!\d)", line))
+        if not amounts:
+            out.append(line)
+            continue
+        end = len(line)
+        chunks: list[str] = []
+        for match in reversed(amounts):
+            side = (
+                "dare"
+                if abs(match.end() - dare_end) <= abs(match.end() - avere_end)
+                else "avere"
+            )
+            label = "MOV.DARE" if side == "dare" else "MOV.AVERE"
+            chunks.append(label + " " + line[match.start() : end])
+            end = match.start()
+        chunks.append(line[:end])
+        out.append("".join(reversed(chunks)))
+    return "\n".join(out)
+
+
 def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[str, object]], Decimal | None]:
     """Estrae movimenti e saldo finale da testo già letto dal PDF."""
     is_amex = _looks_like_amex_estratto(text)
@@ -1638,6 +1695,7 @@ def _parse_statement_text(text: str, *, max_note_len: int) -> tuple[list[dict[st
         rows_bp, cl_bp = _parse_bancoposta_addebiti_accrediti_layout(text, max_note_len=max_note_len)
         if rows_bp:
             return rows_bp, cl_bp
+    text = _bcc_stamp_layout_dare_avere_labels(text)
     prepared = _prepare_statement_lines(text)
     if is_amex:
         prepared = _amex_merge_wrapped_statement_lines(prepared, max_note_len=max_note_len)
@@ -2086,8 +2144,9 @@ def extract_estratto_conto_movements_from_pdf(path: Path, *, max_note_len: int =
                 return EstrattoContoPdfExtract(rows, closing_balance)
         rows, closing_balance = [], None
 
-    # BancoPosta: priorità al layout (colonne Addebiti/Accrediti); plain collassa gli spazi.
-    if is_bancoposta:
+    # BancoPosta e BCC: priorità al layout, dove la colonna dell'importo fissa il segno.
+    # Il plain collassa gli spazi e, con una sola cifra, finirebbe in Avere.
+    if is_bancoposta or _looks_like_bcc_estratto(peek):
         variants: list[tuple[str, bool, str]] = [
             ("layout", True, "\n"),
             ("layout_pages", True, "\n\n"),

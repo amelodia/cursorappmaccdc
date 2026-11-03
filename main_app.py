@@ -2497,6 +2497,79 @@ def format_record_note_stored(note: str) -> str:
     return t
 
 
+def cheque_for_new_record(account_name: str, cheque: str, *, is_credit_card: bool) -> str:
+    """Assegno di una nuova registrazione: Cassa/VIRTUALE senza numero, carta fissa, altrimenti il testo dato."""
+    name = (account_name or "").strip()
+    if name.lower() == "cassa" or name == VIRTUALE_ACCOUNT_NAME:
+        return "-"
+    if is_credit_card:
+        return sanitize_single_line_text(CREDIT_CARD_CHEQUE_LABEL, max_len=MAX_CHEQUE_LEN)
+    chq = sanitize_single_line_text(cheque or "", max_len=MAX_CHEQUE_LEN, strip_edges=False)
+    return chq or "-"
+
+
+def build_record_from_verification_pending(
+    *,
+    date_iso: str,
+    amount: Decimal,
+    note: str,
+    cheque: str,
+    category_code: str,
+    category_display_name: str,
+    category_stored_name: str,
+    category_note: str,
+    account_code: str,
+    account_name: str,
+    secondary_code: str = "",
+    secondary_name: str = "",
+    is_giroconto: bool = False,
+    is_credit_card: bool = False,
+    source_index: int,
+    registration_number: int,
+) -> dict:
+    """Registrazione nuova a partire da un dato di verifica in sospeso (conto della sessione già fissato)."""
+    target_year = int(date_iso[:4])
+    note_stored = format_record_note_stored(
+        sanitize_single_line_text(note or "", max_len=MAX_RECORD_NOTE_LEN, strip_edges=False)
+    ) or "-"
+    chq = cheque_for_new_record(account_name, cheque, is_credit_card=is_credit_card)
+    amt_s = format_money(amount)
+    acc2_code = secondary_code if is_giroconto else ""
+    acc2_name = secondary_name if is_giroconto else ""
+    return {
+        "year": target_year,
+        "source_folder": "APP",
+        "source_file": "manual",
+        "source_index": int(source_index),
+        "legacy_registration_number": int(source_index),
+        "legacy_registration_key": f"APP:manual:{target_year}:{int(source_index)}",
+        "registration_number": int(registration_number),
+        "date_iso": date_iso,
+        "category_code": category_code,
+        "category_name": category_stored_name or category_display_name,
+        "category_note": category_note or "",
+        "account_primary_code": account_code,
+        "account_primary_flags": "",
+        "account_primary_with_flags": account_code,
+        "account_primary_name": account_name,
+        "account_secondary_code": acc2_code,
+        "account_secondary_flags": "",
+        "account_secondary_with_flags": acc2_code,
+        "account_secondary_name": acc2_name,
+        "amount_eur": amt_s,
+        "amount_lire_original": None,
+        "note": note_stored,
+        "cheque": chq,
+        "raw_flags": "",
+        "is_cancelled": False,
+        "source_currency": "E",
+        "display_currency": "E",
+        "display_amount": amt_s,
+        "raw_record": "",
+        "is_virtuale_discharge": False,
+    }
+
+
 def sync_record_category_names_if_identical_old(
     db: dict,
     code: str,
@@ -21028,7 +21101,8 @@ th {{ background:#efefef; text-align:left; }}
     ver_manual_any_amount_submitted: list[bool] = [False]
     # Verifica manuale: progressivo «Dato di verifica n.» quando non c'è coda PDF (si azzera a ogni nuova sessione da setup).
     ver_manual_dato_pick_seq: list[int] = [0]
-    # Sessione avviata con coda PDF (nuovo PDF o ripresa salvata): in pagina risultati non si modificano le non verificate.
+    # Sessione avviata con coda PDF (nuovo PDF o ripresa salvata). In pagina risultati si possono
+    # creare registrazioni dai dati in sospeso e correggere le registrazioni non verificate.
     ver_verifica_used_pdf_coda: list[bool] = [False]
     # Con sessione PDF: «Termina immissione» solo se True (interruzione / annullamento / errore che richiede uscita manuale).
     ver_pdf_termina_immissione_unlock: list[bool] = [False]
@@ -23389,6 +23463,19 @@ th {{ background:#efefef; text-align:left; }}
         relief=tk.RAISED,
         bd=1,
     )
+    ver_btn_create_reg_from_pending = tk.Label(
+        ver_pending_btns,
+        text="Crea registrazione",
+        cursor="hand2",
+        highlightthickness=0,
+        font=filter_ui_font,
+        padx=12,
+        pady=4,
+        bg=_VER_PENDING_BTN_NEW_BG,
+        fg="#ffffff",
+        relief=tk.RAISED,
+        bd=1,
+    )
     ver_btn_abbina_pending = tk.Label(
         ver_pending_btns,
         text="Cerca corrispondenze",
@@ -23651,21 +23738,6 @@ th {{ background:#efefef; text-align:left; }}
                 _yd, rec = pair
                 if record_contains_any_asterisk(rec):
                     want_elimina = False
-
-        if (
-            sel
-            and ver_verifica_used_pdf_coda[0]
-            and _ver_ui_on_results_page()
-            and (want_modifica or want_forza or want_elimina)
-        ):
-            want_modifica = False
-            want_forza = False
-            want_elimina = False
-            want_msg = True
-            msg_text = (
-                "Con la verifica da estratto PDF (coda automatica), in questa schermata non è possibile modificare, "
-                "eliminare né forzare le registrazioni non verificate: usare la pagina immissione o terminare la sessione."
-            )
 
         col = 1
         if want_msg:
@@ -25846,6 +25918,7 @@ th {{ background:#efefef; text-align:left; }}
             ver_btn_del_pending.pack_forget()
             ver_btn_edit_pending.pack_forget()
             ver_btn_abbina_pending.pack_forget()
+            ver_btn_create_reg_from_pending.pack_forget()
             ver_btn_new_ver_data.pack_forget()
             on_res = _ver_ui_on_results_page()
             if on_res and ver_results_new_data_visible[0]:
@@ -25886,6 +25959,7 @@ th {{ background:#efefef; text-align:left; }}
                 return
             if 0 <= idx < len(ver_pending_items[0]) and _ver_item_is_verified(ver_pending_items[0][idx]):
                 return
+            ver_btn_create_reg_from_pending.pack(side=tk.LEFT, padx=(0, 8))
             ver_btn_abbina_pending.pack(side=tk.LEFT, padx=(0, 8))
             ver_btn_edit_pending.pack(side=tk.LEFT, padx=(0, 8))
             ver_btn_del_pending.pack(side=tk.LEFT, padx=(0, 8))
@@ -26033,7 +26107,10 @@ th {{ background:#efefef; text-align:left; }}
         if on_results:
             if has_sosp:
                 ver_pending_lbl.configure(
-                    text="Dati di verifica in sospeso — modifica o elimina prima di «Riavvia ricerca»"
+                    text=(
+                        "Dati di verifica in sospeso — crea la registrazione, "
+                        "oppure modifica o elimina il dato, poi «Riavvia ricerca»"
+                    )
                 )
             else:
                 if not ver_session_active[0] and not has_any:
@@ -26488,6 +26565,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_btn_annulla_sel_pending.pack_forget()
         ver_btn_del_pending.pack_forget()
         ver_btn_edit_pending.pack_forget()
+        ver_btn_create_reg_from_pending.pack_forget()
         ver_btn_new_ver_data.pack_forget()
         stmt_balance = _ver_ask_stmt_balance(initial_balance=closing)
         if stmt_balance is None:
@@ -26530,6 +26608,7 @@ th {{ background:#efefef; text-align:left; }}
         ver_btn_annulla_sel_pending.pack_forget()
         ver_btn_del_pending.pack_forget()
         ver_btn_edit_pending.pack_forget()
+        ver_btn_create_reg_from_pending.pack_forget()
         ver_btn_new_ver_data.pack_forget()
 
         q_bp_end = ver_bancoposta_queue[0]
@@ -27227,6 +27306,300 @@ th {{ background:#efefef; text-align:left; }}
         ver_results_after_persist_cb[0] = _ver_results_after_persist_refresh
         if count_unverified > 0:
             _ver_refresh_ver_unver_correction_bar()
+
+    def _ver_create_registration_from_pending() -> None:
+        """Nuova registrazione dal dato in sospeso selezionato, senza lasciare la pagina risultati."""
+        if not _ver_ui_on_results_page():
+            return
+        if virtuale_discharge_active[0]:
+            messagebox.showwarning(
+                "Verifica",
+                "Lo scarico del saldo virtuale è in corso: concludilo prima di creare una registrazione dalla verifica.",
+                parent=_ver_activate_ui_for_modal_dialog(),
+            )
+            return
+        sel = ver_pending_tree.selection()
+        if not sel:
+            return
+        try:
+            idx = int(sel[0])
+        except (ValueError, IndexError):
+            return
+        if not (0 <= idx < len(ver_pending_items[0])):
+            return
+        item = ver_pending_items[0][idx]
+        if _ver_item_is_verified(item):
+            return
+        acc_code = str(ver_account_code_var.get() or "").strip() or str(
+            ver_session_account_code[0] or ""
+        ).strip()
+        acc_name = ver_account_name_var.get().strip()
+        parent = _ver_activate_ui_for_modal_dialog()
+        if not acc_code or not acc_name:
+            messagebox.showwarning("Verifica", "Conto della verifica non disponibile.", parent=parent)
+            return
+        if account_code_is_frozen(cur_db(), acc_code):
+            messagebox.showwarning(
+                "Verifica",
+                "Il conto della verifica è congelato: non si possono aggiungere registrazioni.",
+                parent=parent,
+            )
+            return
+        try:
+            amount = Decimal(str(item.get("amount") or "0").strip().replace(",", ".")).quantize(Decimal("0.01"))
+        except Exception:
+            messagebox.showerror("Verifica", "Importo del dato in sospeso non valido.", parent=parent)
+            return
+        if amount == Decimal("0"):
+            messagebox.showerror("Verifica", "Importo a zero non ammesso.", parent=parent)
+            return
+
+        cat_opts, acc_opts, cat_notes, _cat_signs, cat_raw = _cat_and_acc_options()
+        if not cat_opts:
+            messagebox.showerror("Verifica", "Nessuna categoria disponibile nel piano conti.", parent=parent)
+            return
+        cat_names = [n for n, _c in cat_opts]
+        other_accounts = _order_account_name_code_pairs(
+            [(n, c) for n, c in acc_opts if n.strip().lower() != acc_name.strip().lower()],
+            virtuale_last=True,
+        )
+        date_initial = _ver_format_pending_item_date(item) or to_italian_date(date.today().isoformat())
+        note_txt = str(item.get("note") or "").strip()
+        is_card = account_is_credit_card_by_code(cur_db(), acc_code)
+        chq_preview = cheque_for_new_record(
+            acc_name, str(item.get("cheque") or ""), is_credit_card=is_card
+        )
+        amt_preview = ("+" if amount >= 0 else "") + format_euro_it(amount)
+
+        dlg = tk.Toplevel(parent)
+        dlg.title("Nuova registrazione dal dato in sospeso")
+        dlg.transient(parent)
+        dlg.configure(bg=_VER_BG)
+        frm = tk.Frame(dlg, bg=_VER_BG, padx=14, pady=12)
+        frm.pack(fill=tk.BOTH, expand=True)
+        tk.Label(
+            frm,
+            text="Conto, importo, data, nota e assegno arrivano dal dato in sospeso. Scegli la categoria.",
+            font=_ver_ui_font,
+            bg=_VER_BG,
+            fg="#1a1a1a",
+            wraplength=460,
+            justify=tk.LEFT,
+            anchor="w",
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+
+        def _lbl(row: int, text: str) -> None:
+            tk.Label(frm, text=text, font=_ver_ui_font_b, bg=_VER_BG, fg="#1a1a1a", anchor="w").grid(
+                row=row, column=0, sticky="nw", padx=(0, 8), pady=3
+            )
+
+        def _val(row: int, text: str) -> None:
+            tk.Label(
+                frm,
+                text=text,
+                font=_ver_ui_font,
+                bg=_VER_BG,
+                fg="#1a1a1a",
+                anchor="w",
+                justify=tk.LEFT,
+                wraplength=320,
+            ).grid(row=row, column=1, sticky="w", pady=3)
+
+        _lbl(1, "Conto")
+        _val(1, acc_name)
+        _lbl(2, "Data")
+        date_var = tk.StringVar(value=date_initial)
+        tk.Entry(frm, textvariable=date_var, width=14, font=_ver_ui_font).grid(
+            row=2, column=1, sticky="w", pady=3
+        )
+        _lbl(3, "Importo")
+        _val(3, f"{amt_preview} €")
+        _lbl(4, "Nota")
+        _val(4, note_txt or "—")
+        _lbl(5, "Assegno")
+        _val(5, chq_preview)
+        _lbl(6, "Categoria")
+        cat_var = tk.StringVar()
+        default_cat = next((n for n in cat_names if n.lower() == "consumi ordinari"), "")
+        if default_cat:
+            cat_var.set(default_cat)
+        cb_cat = ttk.Combobox(frm, textvariable=cat_var, values=cat_names, state="readonly", width=36)
+        cb_cat.grid(row=6, column=1, sticky="w", pady=3)
+        _lbl(7, "Al conto")
+        acc2_var = tk.StringVar()
+        cb_acc2 = ttk.Combobox(
+            frm,
+            textvariable=acc2_var,
+            values=[n for n, _c in other_accounts],
+            state="readonly",
+            width=36,
+        )
+        cb_acc2.grid(row=7, column=1, sticky="w", pady=3)
+        acc2_caption = frm.grid_slaves(row=7, column=0)
+        hint = tk.Label(
+            frm,
+            text="Il dato in sospeso resta in elenco. Dopo la creazione, «Riavvia ricerca» lo abbina.",
+            font=_ver_ui_font,
+            bg=_VER_BG,
+            fg="#555555",
+            wraplength=460,
+            justify=tk.LEFT,
+            anchor="w",
+        )
+        hint.grid(row=8, column=0, columnspan=2, sticky="w", pady=(8, 4))
+
+        def _sync_giro(*_a: object) -> None:
+            show = _is_giro_label(cat_var.get())
+            if show:
+                for w in acc2_caption:
+                    w.grid()
+                cb_acc2.grid()
+            else:
+                for w in acc2_caption:
+                    w.grid_remove()
+                cb_acc2.grid_remove()
+                acc2_var.set("")
+
+        cb_cat.bind("<<ComboboxSelected>>", _sync_giro)
+        _sync_giro()
+
+        def _close() -> None:
+            try:
+                dlg.grab_release()
+            except Exception:
+                pass
+            dlg.destroy()
+
+        def _code_for_account_name(name: str) -> str:
+            if _is_virtuale_account(name):
+                return VIRTUALE_ACCOUNT_NAME
+            return next((c for n, c in acc_opts if n == name), "")
+
+        def _on_create() -> None:
+            d_iso = parse_italian_ddmmyyyy_to_iso(date_var.get())
+            if not d_iso:
+                messagebox.showerror("Verifica", "Data non valida (gg/mm/aaaa).", parent=dlg)
+                return
+            try:
+                dsel = date.fromisoformat(d_iso)
+            except Exception:
+                messagebox.showerror("Verifica", "Data non valida.", parent=dlg)
+                return
+            dmin, dmax = immissione_date_bounds()
+            if dsel < dmin or dsel > dmax:
+                messagebox.showerror(
+                    "Verifica",
+                    "Data fuori intervallo consentito (da -1 anno a +1 anno).",
+                    parent=dlg,
+                )
+                return
+            cat_name = cat_var.get().strip()
+            cat_code = next((c for n, c in cat_opts if n == cat_name), "")
+            if not cat_code:
+                messagebox.showerror("Verifica", "Categoria obbligatoria.", parent=dlg)
+                return
+            giro = _is_giro_label(cat_name)
+            acc2_name = acc2_var.get().strip() if giro else ""
+            acc2_code = _code_for_account_name(acc2_name) if giro else ""
+            if giro and (not acc2_code or acc2_name.strip().lower() == acc_name.strip().lower()):
+                messagebox.showerror(
+                    "Verifica",
+                    "Nel giroconto il secondo conto è obbligatorio e diverso dal primo.",
+                    parent=dlg,
+                )
+                return
+            if giro and account_code_is_frozen(cur_db(), acc2_code):
+                messagebox.showwarning(
+                    "Verifica",
+                    "Il secondo conto è congelato: scegline un altro.",
+                    parent=dlg,
+                )
+                return
+            y_bucket = _ensure_year_bucket(dsel.year)
+            y_records = y_bucket.get("records", [])
+            source_index = max((int(r.get("source_index", 0) or 0) for r in y_records), default=0) + 1
+            rec = build_record_from_verification_pending(
+                date_iso=d_iso,
+                amount=amount,
+                note=note_txt,
+                cheque=str(item.get("cheque") or ""),
+                category_code=cat_code,
+                category_display_name=cat_name,
+                category_stored_name=cat_raw.get(cat_code, cat_name),
+                category_note=cat_notes.get(cat_code, "") or "",
+                account_code=acc_code,
+                account_name=acc_name,
+                secondary_code=acc2_code,
+                secondary_name=acc2_name,
+                is_giroconto=giro,
+                is_credit_card=is_card,
+                source_index=source_index,
+                registration_number=_next_registration_number(),
+            )
+            preview_acc2 = f", {acc2_name}" if giro else ""
+            preview = (
+                f"Data {to_italian_date(d_iso)}, {cat_name}, {acc_name}{preview_acc2}, {amt_preview} €"
+            )
+            if not messagebox.askyesno(
+                "Nuova registrazione",
+                f"Confermi l'inserimento della registrazione?\n\n{preview}",
+                parent=dlg,
+            ):
+                return
+            y_bucket.setdefault("records", []).append(rec)
+            try:
+                save_encrypted_db_dual(
+                    cur_db(),
+                    Path(data_file_var.get()),
+                    Path(key_file_var.get()),
+                )
+            except Exception as exc:
+                try:
+                    y_bucket["records"].remove(rec)
+                except ValueError:
+                    pass
+                messagebox.showerror("Verifica", str(exc), parent=dlg)
+                return
+            _close()
+            _movements_dirty[0] = True
+            try:
+                populate_movements_trees(preserve_scroll=True)
+            except Exception:
+                pass
+            try:
+                refresh_balance_footer()
+            except Exception:
+                pass
+            raw_sb = ver_stmt_balance_var.get().strip()
+            try:
+                sb = Decimal(raw_sb) if raw_sb else Decimal("0")
+            except Exception:
+                sb = Decimal("0")
+            _ver_show_results(acc_code, sb)
+            try:
+                ver_pending_lbl.configure(
+                    text=(
+                        "Registrazione creata. Il dato in sospeso resta in elenco: "
+                        "«Riavvia ricerca» per abbinarlo."
+                    )
+                )
+            except tk.TclError:
+                pass
+
+        bf = tk.Frame(frm, bg=_VER_BG)
+        bf.grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        tk.Button(bf, text="Annulla", command=_close).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(bf, text="Crea registrazione", command=_on_create).pack(side=tk.LEFT)
+        dlg.protocol("WM_DELETE_WINDOW", _close)
+        try:
+            center_toplevel_on_screen(dlg, min_width=520)
+            dlg.grab_set()
+            cb_cat.focus_set()
+        except Exception:
+            pass
+        dlg.wait_window()
+
+    ver_btn_create_reg_from_pending.bind("<Button-1>", lambda _e: _ver_create_registration_from_pending())
 
     # ---- Stampa risultati ----
     def _ver_on_print() -> None:
