@@ -15,8 +15,9 @@ alwaysApply: true
 
 ## Conti Light
 
-- Repo Xcode: `/Users/macand/Library/CloudStorage/Dropbox/ContiLight/ContiLight` (un solo `.git`, un solo `ContiLight.xcodeproj`).
-- Mirror nel desktop: `iphone_light/ios/` (allineare i Swift da qui verso ContiLight o viceversa).
+- Repo Xcode: `/Users/macand/Library/CloudStorage/Dropbox/ContiLight/ContiLight` (un solo `.git`, un solo `ContiLight.xcodeproj`). I sorgenti stanno in `ContiLight/ContiLight/`.
+- Mirror nel desktop: `iphone_light/ios/` (`ContiLightApp/` e `ContiLightCore/`).
+- Ogni file modificato va scritto **subito in entrambe** le cartelle Dropbox, prima di chiudere il lavoro: la copia in `CursorAppMacCdc/iphone_light/ios/` e la copia omonima in `ContiLight/ContiLight/`. Non lasciare una sola delle due aggiornata.
 - Commit Light e desktop sono **due repository distinti**.
 
 ## Versione applicazione desktop

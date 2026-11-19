@@ -96,6 +96,9 @@ struct ContentView: View {
     @State private var filterCategoryKey = ""
     @State private var filterAccountKey = ""
     @State private var folderPickRequest: FolderPickRequest?
+    /// File `*_light.enc` scelto nel selettore: quella URL è un download nuovo, non la copia in cache della cartella.
+    @State private var pickedLightEncURL: URL?
+    @State private var lightFilePickRequest: FolderPickRequest?
     /// Navigazione interna alla sheet Filtri (tap → lista, senza NavigationLink lento).
     @State private var filtriNavigationPath = NavigationPath()
     /// Elenco movimenti: per data o per numero di registrazione (globale).
@@ -379,7 +382,24 @@ struct ContentView: View {
                     Button("Cambia cartella…") {
                         folderPickRequest = FolderPickRequest()
                     }
+                    Button("Apri il file light aggiornato…") {
+                        lightFilePickRequest = FolderPickRequest()
+                    }
+                    .disabled(isBusy || isAligningCloud)
+                    Text(
+                        "Se l’unico file light senza «conflicted copy» è vecchio di settimane, " +
+                            "l’app File sta mostrando la copia locale, non il file aggiornato su Dropbox. " +
+                            "Nell’app Dropbox: Account → Impostazioni → File → Integrazione nativa con l’app File → " +
+                            "Converti tutto all’integrazione classica. Poi in Conti Light tocca «Cambia cartella…», " +
+                            "riapri ContiCursor e Accedi. Il messaggio di accesso indica la data dei dati aperti."
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
                     Button("Rimuovi cartella salvata", role: .destructive) {
+                        if let picked = pickedLightEncURL {
+                            picked.stopAccessingSecurityScopedResource()
+                        }
+                        pickedLightEncURL = nil
                         ContiLightFolderBookmark.clear()
                         dataFolderURL = nil
                         keyStatusText = ""
@@ -399,6 +419,36 @@ struct ContentView: View {
         .scrollContentBackground(.visible)
         .navigationTitle("Conti di casa")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $lightFilePickRequest) { _ in
+            DocumentFilePickerRepresentable(
+                onPick: { url in
+                    Task { @MainActor in
+                        lightFilePickRequest = nil
+                        let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                        let name = url.lastPathComponent
+                        guard !isDirectory, name.lowercased().hasSuffix(".enc"), name.lowercased().contains("light") else {
+                            message = "Seleziona il file *_light.enc (non la cartella e non il database completo)."
+                            return
+                        }
+                        if let previous = pickedLightEncURL {
+                            previous.stopAccessingSecurityScopedResource()
+                        }
+                        guard url.startAccessingSecurityScopedResource() else {
+                            message = "Accesso al file negato. Riprova dal selettore."
+                            return
+                        }
+                        pickedLightEncURL = url
+                        message = "File scelto: \(name). Tocca Accedi."
+                    }
+                },
+                onCancel: {
+                    Task { @MainActor in
+                        lightFilePickRequest = nil
+                    }
+                }
+            )
+            .ignoresSafeArea()
+        }
         .sheet(item: $folderPickRequest) { _ in
             DocumentFolderPickerRepresentable(
                 onPick: { url in
@@ -462,6 +512,14 @@ struct ContentView: View {
         } else {
             let stem = ContiDatabase.userEncFilenameStem(forEmail: em)
             lightFileStatusText = "File light non trovato (atteso: \(stem)_light.enc nella cartella)."
+        }
+        let conflicted = ContiDatabase.dropboxConflictedEncFilenames(inFolder: folder)
+        if !conflicted.isEmpty {
+            let n = conflicted.count
+            let line = n == 1
+                ? "1 copia in conflitto è visibile solo nella cache dell’app File: non è su Dropbox e non viene aperta."
+                : "\(n) copie in conflitto sono visibili solo nella cache dell’app File: non sono su Dropbox e non vengono aperte."
+            lightFileStatusText += "\n" + line
         }
         if !em.isEmpty {
             let stemName = ContiDatabase.userEncFilenameStem(forEmail: em)
@@ -945,7 +1003,7 @@ struct ContentView: View {
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
                 folderURL: folderURL,
-                lightEncURLIfKnown: nil,
+                lightEncURLIfKnown: pickedLightEncURL,
                 forceCloudRedownload: true
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
@@ -978,7 +1036,7 @@ struct ContentView: View {
                 emailTrim: emailTrim,
                 passwordTrim: passwordTrim,
                 folderURL: folder,
-                lightEncURLIfKnown: nil,
+                lightEncURLIfKnown: pickedLightEncURL,
                 forceCloudRedownload: true
             )
             applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
@@ -1184,11 +1242,13 @@ struct ContentView: View {
                     return
                 }
                 // Il segnaposto si controlla in ``acquireSessionWorkspaceLockForOpen`` (stesso criteri «materiato»/scrittura).
-                let encRef: URL
+                var encRef: URL
                 if let known = lightEncURLIfKnown {
                     encRef = known
                 } else if let resolved = ContiDatabase.resolvePrimaryEncURL(inFolder: folderURL, email: emailTrim) {
                     encRef = resolved
+                } else if let any = ContiDatabase.lightFileCandidates(inFolder: folderURL, email: emailTrim).first {
+                    encRef = any
                 } else {
                     let stem = ContiDatabase.userEncFilenameStem(forEmail: emailTrim)
                     packet = LoginResultPacket(
@@ -1208,10 +1268,11 @@ struct ContentView: View {
                 let fullEncURL = ContiDatabase.perUserEncURL(primaryEnc: encRef, email: emailTrim)
                 let cloudWait = ContiDatabase.requestFreshCloudMaterialization(
                     of: encRef,
-                    forceEvict: forceCloudRedownload
+                    forceEvict: forceCloudRedownload && lightEncURLIfKnown == nil
                 )
                 let lightSize = (try? FileManager.default.attributesOfItem(atPath: encRef.path)[.size] as? NSNumber)?.int64Value ?? 0
-                if forceCloudRedownload, lightSize <= 0 {
+                if forceCloudRedownload, lightEncURLIfKnown == nil, lightSize <= 0,
+                   ContiDatabase.lightFileCandidates(inFolder: folderURL, email: emailTrim).isEmpty {
                     packet = LoginResultPacket(
                         message: """
                         Non riesco a scaricare il file light aggiornato da Dropbox (la copia sul telefono era probabilmente quella dell’ultima apertura). \
@@ -1240,23 +1301,45 @@ struct ContentView: View {
                     ? String(format: "Attesa sincronizzazione Dropbox: %.1fs.", totalWait)
                     : ""
                 var pendingFlushNote = ""
-                if ContiDatabase.pendingLightSessionExists() {
-                    do {
-                        try ContiDatabase.writePendingLightSessionIfPresent(to: encRef)
-                        pendingFlushNote = "Scritte su Dropbox le registrazioni rimaste in sospeso dalla sessione precedente."
-                    } catch {
-                        pendingFlushNote = "Ci sono registrazioni locali non ancora scritte su Dropbox: \(error.localizedDescription)"
-                    }
-                }
+                var sourceNote = ""
 
                 do {
-                    let encData = try ContiDatabase.coordinatedDataContents(of: encRef)
                     let keyString = try ContiDatabase.coordinatedStringContents(of: keyRef, encoding: .utf8)
-                    let (db, _) = try ContiDatabase.loadDBForEmail(
-                        primaryEncData: encData,
+                    let pickedAccess = lightEncURLIfKnown?.startAccessingSecurityScopedResource() ?? false
+                    defer {
+                        if pickedAccess, let known = lightEncURLIfKnown {
+                            known.stopAccessingSecurityScopedResource()
+                        }
+                    }
+                    let freshest = try ContiDatabase.readFreshestLightDatabase(
+                        inFolder: folderURL,
+                        email: emailTrim,
                         keyString: keyString,
-                        primaryEncURL: encRef
+                        preferredURL: lightEncURLIfKnown
                     )
+                    encRef = freshest.url
+                    var db = freshest.db
+                    let day = freshest.generatedDay ?? "sconosciuta"
+                    sourceNote = "Aperto \(freshest.url.lastPathComponent), dati del \(day)."
+                    if ContiDatabase.pendingLightSessionExists() {
+                        do {
+                            if let pendingDB = try ContiDatabase.loadPendingLightSessionDB(keyString: keyString),
+                               ContiDatabase.pendingLightSessionShouldReplaceCloud(
+                                   cloudDB: db,
+                                   pendingDB: pendingDB,
+                                   cloudURL: encRef
+                               ) {
+                                try ContiDatabase.writePendingLightSessionIfPresent(to: encRef)
+                                db = pendingDB
+                                pendingFlushNote = "Scritte su Dropbox le registrazioni rimaste in sospeso dalla sessione precedente."
+                            } else {
+                                ContiDatabase.quarantineStalePendingLightSession()
+                                pendingFlushNote = "Sul telefono c’era una copia locale più vecchia del file Dropbox: non l’ho usata. Apro il file aggiornato."
+                            }
+                        } catch {
+                            pendingFlushNote = "Copia locale in sospeso non applicata, uso il file Dropbox. \(error.localizedDescription)"
+                        }
+                    }
                     if ContiDatabase.tryLogin(db: db, email: emailTrim, password: passwordTrim) != nil {
                         if !skipSessionWorkspaceLock {
                             do {
@@ -1284,6 +1367,7 @@ struct ContentView: View {
                             ? "Accesso effettuato. Nessun movimento nel file light."
                             : "Accesso effettuato."
                         var notes: [String] = []
+                        if !sourceNote.isEmpty { notes.append(sourceNote) }
                         if !syncWaitNote.isEmpty { notes.append(syncWaitNote) }
                         if !pendingFlushNote.isEmpty { notes.append(pendingFlushNote) }
                         let msgOut = notes.isEmpty ? baseMsg : baseMsg + "\n\n" + notes.joined(separator: "\n")
@@ -1432,6 +1516,47 @@ private struct DocumentFolderPickerRepresentable: UIViewControllerRepresentable 
             DispatchQueue.main.async {
                 self.onCancel()
             }
+        }
+    }
+}
+
+private struct DocumentFilePickerRepresentable: UIViewControllerRepresentable {
+    var onPick: (URL) -> Void
+    var onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick, onCancel: onCancel)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let encType = UTType(filenameExtension: "enc") ?? .data
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: [encType], asCopy: false)
+        picker.delegate = context.coordinator
+        picker.allowsMultipleSelection = false
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {}
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let onPick: (URL) -> Void
+        let onCancel: () -> Void
+
+        init(onPick: @escaping (URL) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            guard let u = urls.first else {
+                DispatchQueue.main.async { self.onCancel() }
+                return
+            }
+            DispatchQueue.main.async { self.onPick(u) }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            DispatchQueue.main.async { self.onCancel() }
         }
     }
 }

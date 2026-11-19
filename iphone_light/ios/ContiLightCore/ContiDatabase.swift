@@ -330,9 +330,143 @@ nonisolated public enum ContiDatabase {
         return nil
     }
 
-    /// File `*_light.enc` per l’email; mai database completi.
+    /// Tutti i sidecar light dell’utente, comprese le «conflicted copy».
+    /// Il File Provider può tenere il nome canonico fermo a una copia vecchia e il file aggiornato sotto un altro nome.
+    public nonisolated static func lightFileCandidates(inFolder folder: URL, email: String) -> [URL] {
+        let stem = userEncFilenameStem(forEmail: email)
+        let lightPrefix = "\(stem)_light".lowercased()
+        let fullName = "\(stem).enc".lowercased()
+        let fm = FileManager.default
+        let listed = (try? fm.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        var out: [URL] = []
+        for url in listed {
+            let lower = url.lastPathComponent.lowercased()
+            guard lower.hasSuffix(".enc") else { continue }
+            guard lower != fullName else { continue }
+            guard !lower.hasSuffix("_backup.enc") else { continue }
+            guard lower.hasPrefix(lightPrefix) else { continue }
+            let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+            if size > 12_000_000 { continue }
+            out.append(url)
+        }
+        if let exact = resolvePrimaryEncURL(inFolder: folder, email: email),
+           !out.contains(where: { $0.lastPathComponent == exact.lastPathComponent }) {
+            out.append(exact)
+        }
+        return out.sorted { contentModificationDate($0) > contentModificationDate($1) }
+    }
+
+    /// Legge i sidecar light (anche le copie in conflitto) e tiene quello con `light_sidecar_generated_at` più recente.
+    public static func readFreshestLightDatabase(
+        inFolder folder: URL,
+        email: String,
+        keyString: String,
+        preferredURL: URL?
+    ) throws -> (db: [String: Any], url: URL, generatedDay: String?) {
+        var urls = lightFileCandidates(inFolder: folder, email: email)
+        if let preferredURL {
+            let already = urls.contains { $0.standardizedFileURL.path == preferredURL.standardizedFileURL.path }
+            if !already {
+                urls.insert(preferredURL, at: 0)
+            }
+        }
+        if urls.isEmpty {
+            throw ContiDBError.cannotReadEnc
+        }
+        var capped = Array(urls.prefix(8))
+        func alreadyListed(_ url: URL) -> Bool {
+            capped.contains { $0.standardizedFileURL.path == url.standardizedFileURL.path }
+        }
+        if let preferredURL, !alreadyListed(preferredURL) {
+            capped.insert(preferredURL, at: 0)
+        }
+        if let canonical = resolvePrimaryEncURL(inFolder: folder, email: email), !alreadyListed(canonical) {
+            capped.append(canonical)
+        }
+        struct Rank {
+            var day: String
+            var url: URL
+            var db: [String: Any]
+            var picked: Bool
+            var canonical: Bool
+            var mtime: Date
+        }
+        var best: Rank?
+        var lastError: Error = ContiDBError.cannotReadEnc
+        for url in capped {
+            do {
+                let data = try readEncBytesOnce(url)
+                let db = try decryptPayload(encData: data, keyString: keyString, loginOnly: true)
+                let day = lightSidecarGeneratedDay(db) ?? ""
+                let rank = Rank(
+                    day: day,
+                    url: url,
+                    db: db,
+                    picked: preferredURL?.standardizedFileURL.path == url.standardizedFileURL.path,
+                    canonical: !dropboxConflictedEncNamePatternMatches(url.lastPathComponent),
+                    mtime: contentModificationDate(url)
+                )
+                if let current = best {
+                    if rank.day != current.day {
+                        if rank.day > current.day { best = rank }
+                    } else if rank.picked != current.picked {
+                        if rank.picked { best = rank }
+                    } else if rank.canonical != current.canonical {
+                        if rank.canonical { best = rank }
+                    } else if rank.mtime > current.mtime {
+                        best = rank
+                    }
+                } else {
+                    best = rank
+                }
+            } catch {
+                lastError = error
+            }
+        }
+        guard let best else { throw lastError }
+        return (best.db, best.url, best.day.isEmpty ? nil : best.day)
+    }
+
+    /// Una sola lettura coordinata, senza l’attesa doppia usata al salvataggio.
+    private static func readEncBytesOnce(_ url: URL) throws -> Data {
+        let coordinator = NSFileCoordinator(filePresenter: nil)
+        var coordinatorError: NSError?
+        var result: Result<Data, Error>?
+        coordinator.coordinate(readingItemAt: url, options: [], error: &coordinatorError) { readURL in
+            result = Result {
+                let fm = FileManager.default
+                let tmp = fm.temporaryDirectory.appendingPathComponent("conti-light-pick-\(UUID().uuidString).enc")
+                if fm.fileExists(atPath: tmp.path) {
+                    try? fm.removeItem(at: tmp)
+                }
+                try fm.copyItem(at: readURL, to: tmp)
+                defer { try? fm.removeItem(at: tmp) }
+                let data = try Data(contentsOf: tmp, options: [.uncached])
+                if data.isEmpty { throw ContiDBError.cannotReadEnc }
+                return data
+            }
+        }
+        if let coordinatorError { throw coordinatorError }
+        guard let result else { throw ContiDBError.cannotReadEnc }
+        return try result.get()
+    }
+
+    /// File `*_light.enc` per l’email; mai database completi e mai «conflicted copy».
+    /// Preferisce l’URL restituito dall’elenco del File Provider (identità attuale), non un path ricostruito
+    /// che può ancora puntare alla materializzazione vecchia.
     public nonisolated static func resolvePrimaryEncURL(inFolder folder: URL, email: String) -> URL? {
-        firstExistingURL(in: userDatabaseEncURLCandidates(inFolder: folder, email: email))
+        let wanted = "\(userEncFilenameStem(forEmail: email))_light.enc"
+        let listed = lightEncURLs(inFolder: folder).filter {
+            $0.lastPathComponent.compare(wanted, options: [.caseInsensitive]) == .orderedSame
+        }
+        if let best = listed.max(by: { contentModificationDate($0) < contentModificationDate($1) }) {
+            return best
+        }
+        return firstExistingURL(in: userDatabaseEncURLCandidates(inFolder: folder, email: email))
     }
 
     /// Un file `.key` nella cartella (preferenza `conti_di_casa.key`).
@@ -381,8 +515,35 @@ nonisolated public enum ContiDatabase {
             includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey],
             options: [.skipsHiddenFiles]
         ) else { return [] }
-        return urls.filter { $0.lastPathComponent.lowercased().hasSuffix("_light.enc") }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+        return urls.filter { url in
+            let name = url.lastPathComponent
+            guard name.lowercased().hasSuffix("_light.enc") else { return false }
+            return !dropboxConflictedEncNamePatternMatches(name)
+        }
+        .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    }
+
+    private nonisolated static func contentModificationDate(_ url: URL) -> Date {
+        dropResourceValueCache(url)
+        if let d = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+            return d
+        }
+        return fileFingerprint(url)?.mtime ?? .distantPast
+    }
+
+    private nonisolated static func fingerprintsEqual(
+        _ a: (size: NSNumber, mtime: Date)?,
+        _ b: (size: NSNumber, mtime: Date)?
+    ) -> Bool {
+        switch (a, b) {
+        case (nil, nil):
+            return true
+        case let (lhs?, rhs?):
+            return lhs.size.int64Value == rhs.size.int64Value
+                && abs(lhs.mtime.timeIntervalSince(rhs.mtime)) < 0.001
+        default:
+            return false
+        }
     }
 
     private nonisolated static func bumpFileProviderDirectoryListing(_ folder: URL) {
@@ -411,6 +572,7 @@ nonisolated public enum ContiDatabase {
         let t0 = Date().timeIntervalSinceReferenceDate
         dropResourceValueCache(url)
         bumpFileProviderDirectoryListing(url.deletingLastPathComponent())
+        let before = fileFingerprint(url)
 
         if forceEvict {
             do {
@@ -428,6 +590,11 @@ nonisolated public enum ContiDatabase {
         let deadline = t0 + maxWaitSeconds
         let poll: TimeInterval = 0.25
         let minWait: TimeInterval = forceEvict ? 0.8 : 0
+        // Dropbox spesso lascia lo stato ubiquo a nil: non trattarlo come «già aggiornato».
+        let nilStatusGiveUp: TimeInterval = forceEvict ? 8 : 0
+        var sawNotCurrent = false
+        var stableSince = Date().timeIntervalSinceReferenceDate
+        var lastFP = before
         while Date().timeIntervalSinceReferenceDate < deadline {
             dropResourceValueCache(url)
             let values = try? url.resourceValues(forKeys: [
@@ -438,18 +605,36 @@ nonisolated public enum ContiDatabase {
             let downloading = values?.ubiquitousItemIsDownloading ?? false
             let status = values?.ubiquitousItemDownloadingStatus
             let exists = FileManager.default.fileExists(atPath: url.path)
-            let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
+            let fp = fileFingerprint(url)
+            let size = fp?.size.int64Value ?? 0
             let waited = Date().timeIntervalSinceReferenceDate - t0
+            if !fingerprintsEqual(fp, lastFP) {
+                lastFP = fp
+                stableSince = Date().timeIntervalSinceReferenceDate
+            }
+            let changed = !fingerprintsEqual(before, fp)
+            let stableFor = Date().timeIntervalSinceReferenceDate - stableSince
+            if status == .notDownloaded || status == .downloaded || downloading {
+                sawNotCurrent = true
+            }
             if waited >= minWait, exists, size > 0, !downloading {
-                if forceEvict {
-                    if status == nil || status == .current {
-                        break
-                    }
-                    // `.downloaded` dopo evict può essere ancora la copia vecchia: attendi `.current` o il timeout.
-                    if status == .downloaded, waited >= min(12, maxWaitSeconds) {
-                        break
-                    }
-                } else {
+                if !forceEvict {
+                    break
+                }
+                if status == .current, sawNotCurrent || changed || before == nil {
+                    break
+                }
+                // Il provider dice «current» ma i byte non sono cambiati: non bloccare l’accesso.
+                if status == .current, !changed, stableFor >= 1.5 {
+                    break
+                }
+                if changed, (status == nil || status == .current || status == .downloaded), stableFor >= 1.2 {
+                    break
+                }
+                if status == .downloaded, !changed, waited >= 12 {
+                    break
+                }
+                if status == nil, !changed, waited >= nilStatusGiveUp, stableFor >= 1.5 {
                     break
                 }
             }
@@ -480,7 +665,12 @@ nonisolated public enum ContiDatabase {
             _ = waitForFileStableIfDropbox(u, maxWaitSeconds: 60)
         }
         let names = targets.map(\.lastPathComponent).joined(separator: ", ")
-        return "Richiesta a Dropbox completata per \(names). Controlla la data «aggiornato» qui sotto: deve coincidere con quella in Dropbox, poi tocca Accedi."
+        var msg = "Richiesta a Dropbox completata per \(names). Controlla la data «aggiornato» qui sotto: deve coincidere con quella in Dropbox, poi tocca Accedi."
+        let ghosts = dropboxConflictedEncFilenames(inFolder: folder)
+        if !ghosts.isEmpty {
+            msg += "\n\nNella cache dell’app File compaiono \(ghosts.count) copie in conflitto che non sono nella cartella Dropbox: non vengono aperte."
+        }
+        return msg
     }
 
     private nonisolated static func fileFingerprint(_ url: URL) -> (size: NSNumber, mtime: Date)? {
@@ -656,6 +846,45 @@ nonisolated public enum ContiDatabase {
                     + "Chiudi Conti di casa sul computer e attendi la sincronizzazione Dropbox, poi riprova."
             )
         }
+    }
+
+    /// Nomi delle copie Dropbox in conflitto ancora visibili al File Provider (anche se assenti sul server).
+    public nonisolated static func dropboxConflictedEncFilenames(inFolder folder: URL) -> [String] {
+        let fm = FileManager.default
+        guard let urls = try? fm.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return [] }
+        return urls.filter { u in
+            u.pathExtension.lowercased() == "enc" && dropboxConflictedEncNamePatternMatches(u.lastPathComponent)
+        }
+        .map(\.lastPathComponent)
+        .sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    /// Giorno `yyyy-MM-dd` di ``light_sidecar_generated_at``, se presente.
+    public nonisolated static func lightSidecarGeneratedDay(_ db: [String: Any]) -> String? {
+        let raw = (db["light_sidecar_generated_at"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard raw.count >= 10 else { return nil }
+        let day = String(raw.prefix(10))
+        guard day.allSatisfy({ $0.isNumber || $0 == "-" }) else { return nil }
+        return day
+    }
+
+    /// Il timestamp del file è di almeno una settimana successivo al giorno scritto nel JSON:
+    /// la cache ha consegnato byte vecchi di un file che sul provider risulta più recente.
+    public nonisolated static func cloudFileLooksNewerThanSidecarContent(fileURL: URL, db: [String: Any]) -> Bool {
+        guard let day = lightSidecarGeneratedDay(db) else { return false }
+        let mtime = contentModificationDate(fileURL)
+        guard mtime != .distantPast else { return false }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "yyyy-MM-dd"
+        guard let contentDate = formatter.date(from: day) else { return false }
+        return mtime.timeIntervalSince(contentDate) > 7 * 24 * 60 * 60
     }
 
     /// Nome file stile Dropbox (`… (nome's conflicted copy).enc` o «copia in conflitto»).
@@ -2858,6 +3087,60 @@ nonisolated public enum ContiDatabase {
 
     public static func pendingLightSessionExists() -> Bool {
         FileManager.default.fileExists(atPath: pendingLightSessionEncURL().path)
+    }
+
+    /// Decifra la copia locale in sospeso. `nil` se il file non c’è.
+    public static func loadPendingLightSessionDB(keyString: String) throws -> [String: Any]? {
+        localInstanceMutex.lock()
+        let data: Data?
+        do {
+            let pending = pendingLightSessionEncURL()
+            if FileManager.default.fileExists(atPath: pending.path) {
+                data = try Data(contentsOf: pending)
+            } else {
+                data = nil
+            }
+            localInstanceMutex.unlock()
+        } catch {
+            localInstanceMutex.unlock()
+            throw error
+        }
+        guard let data else { return nil }
+        return try decryptPayload(encData: data, keyString: keyString, loginOnly: true)
+    }
+
+    /// La copia locale sostituisce il file Dropbox solo se è più recente (giorno del sidecar, poi data file).
+    /// Una sessione rimasta sul telefono da settimane non deve riscrivere il `*_light.enc` aggiornato dal desktop.
+    public static func pendingLightSessionShouldReplaceCloud(
+        cloudDB: [String: Any],
+        pendingDB: [String: Any],
+        cloudURL: URL
+    ) -> Bool {
+        let cloudDay = lightSidecarGeneratedDay(cloudDB)
+        let pendingDay = lightSidecarGeneratedDay(pendingDB)
+        if let cloudDay, let pendingDay, pendingDay != cloudDay {
+            return pendingDay > cloudDay
+        }
+        guard let pendingMtime = fileFingerprint(pendingLightSessionEncURL())?.mtime,
+              let cloudMtime = fileFingerprint(cloudURL)?.mtime else {
+            return false
+        }
+        return pendingMtime.timeIntervalSince(cloudMtime) > 2
+    }
+
+    /// Sposta la copia locale superata dal file Dropbox, così gli accessi successivi non la riapplicano.
+    public static func quarantineStalePendingLightSession() {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        let fm = FileManager.default
+        let pending = pendingLightSessionEncURL()
+        guard fm.fileExists(atPath: pending.path) else { return }
+        let stale = pending.deletingLastPathComponent()
+            .appendingPathComponent("pending_light_session.stale.enc", isDirectory: false)
+        if fm.fileExists(atPath: stale.path) {
+            try? fm.removeItem(at: stale)
+        }
+        try? fm.moveItem(at: pending, to: stale)
     }
 
     /// Generazione della copia locale. La scrittura Dropbox cancella il file solo se nel frattempo non è arrivata un’altra registrazione.
