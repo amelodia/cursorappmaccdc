@@ -490,6 +490,32 @@ def write_light_enc_sidecar(db: dict, primary_enc: Path, key_path: Path) -> None
     _atomic_write_bytes(out, token)
 
 
+def import_new_light_records_into_main(main: dict, primary_enc: Path, key_path: Path) -> int:
+    """Aggiunge al DB in memoria le registrazioni light non ancora nel completo.
+
+    Va chiamato prima di riscrivere ``*_light.enc``: un salvataggio desktop non deve
+    sostituire il sidecar con una copia che non contiene le righe immesse sul telefono.
+    Non fa upsert delle righe già presenti: non riporta indietro una modifica appena fatta sul desktop.
+    """
+    p = light_enc_path_for_primary(primary_enc)
+    if not p.is_file() or not key_path.is_file():
+        return 0
+    try:
+        import cloud_sync_wait
+
+        cloud_sync_wait.wait_for_paths_stable_if_cloud(
+            [p, key_path],
+            ui_parent=None,
+            light_sidecar=True,
+        )
+    except Exception:
+        pass
+    light = load_light_enc_if_present(primary_enc, key_path)
+    if not light:
+        return 0
+    return merge_light_new_records_into_main(main, light)
+
+
 def load_light_enc_if_present(primary_enc: Path, key_path: Path) -> dict | None:
     """Carica il sidecar light accanto al file principale, se esiste."""
     if Fernet is None:

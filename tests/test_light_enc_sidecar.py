@@ -9,6 +9,8 @@ from light_enc_sidecar import (
     LIGHT_EDIT_SUPERSEDES_SI,
     LIGHT_EDIT_SUPERSEDES_YEAR,
     LIGHT_RECORD_ID_KEY,
+    Fernet,
+    import_new_light_records_into_main,
     merge_light_new_records_into_main,
     merge_light_sidecar_into_main,
     upsert_light_session_records_in_main,
@@ -166,6 +168,36 @@ class LightEncSidecarMergeTests(unittest.TestCase):
         light = {"years": [_year_bucket(2025, [copy.deepcopy(rec)])]}
         n_new, n_up = merge_light_sidecar_into_main(main, light)
         self.assertEqual((n_new, n_up), (0, 0))
+
+    def test_import_before_save_keeps_phone_rows_and_desktop_edits(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        if Fernet is None:
+            self.skipTest("cryptography non disponibile")
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            key_path = root / "conti_di_casa.key"
+            key_path.write_bytes(Fernet.generate_key())
+            primary = root / "conti_utente_abc.enc"
+            light_path = root / "conti_utente_abc_light.enc"
+            primary.write_bytes(b"")
+            desktop = _rec(rid="uuid-desk", amount=7)
+            phone = _rec(rid="uuid-phone", amount=3, source_index=2)
+            main = {"years": [_year_bucket(2025, [copy.deepcopy(desktop)])]}
+            light = {"years": [_year_bucket(2025, [copy.deepcopy(desktop), phone])]}
+            light["years"][0]["records"][0]["amount"] = 1
+            token = Fernet(key_path.read_bytes()).encrypt(
+                json.dumps(light).encode("utf-8")
+            )
+            light_path.write_bytes(token)
+            added = import_new_light_records_into_main(main, primary, key_path)
+            self.assertEqual(added, 1)
+            rows = main["years"][0]["records"]
+            self.assertEqual(len(rows), 2)
+            kept = next(r for r in rows if r[LIGHT_RECORD_ID_KEY] == "uuid-desk")
+            self.assertEqual(kept["amount"], 7)
 
     def test_inplace_write_keeps_inode_and_leaves_no_tmp(self) -> None:
         import tempfile

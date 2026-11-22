@@ -469,6 +469,55 @@ nonisolated public enum ContiDatabase {
         return firstExistingURL(in: userDatabaseEncURLCandidates(inFolder: folder, email: email))
     }
 
+    /// Cartella dati del desktop: chiave e database completo nella stessa directory.
+    /// Un `*_light.enc` da solo non basta, così non si tratta come dati una cartella Dropbox qualsiasi.
+    public nonisolated static func folderLooksLikeDesktopDataFolder(_ folder: URL) -> Bool {
+        guard preferredKeyFileURL(inFolder: folder) != nil else { return false }
+        return fullUserEncURL(inFolder: folder) != nil
+    }
+
+    /// `nil` se l’elenco non è leggibile, è vuoto, oppure c’è già la chiave o il database completo.
+    /// Messaggio solo se la cartella ha altri file e non è quella dei dati (es. un `*_light.enc` finito altrove).
+    public nonisolated static func rejectReasonIfNotDesktopDataFolder(_ folder: URL) -> String? {
+        guard let listed = try? FileManager.default.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else { return nil }
+        if listed.isEmpty { return nil }
+        if folderLooksLikeDesktopDataFolder(folder) { return nil }
+        let hasKey = listed.contains { $0.pathExtension.lowercased() == "key" }
+        if hasKey || fullUserEncURL(inFolder: folder) != nil { return nil }
+        let name = folder.lastPathComponent
+        return """
+        La cartella «\(name)» non contiene conti_di_casa.key e il database completo. \
+        I file dati stanno in Dropbox → ContiCursor. Riseleziona quella cartella: \
+        il file .enc non viene cercato né creato altrove.
+        """
+    }
+
+    /// Database completo `conti_utente_*.enc` (mai sidecar, backup o copia in conflitto).
+    public nonisolated static func fullUserEncURL(inFolder folder: URL) -> URL? {
+        let listed = (try? FileManager.default.contentsOfDirectory(
+            at: folder.standardizedFileURL,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        for url in listed {
+            let lower = url.lastPathComponent.lowercased()
+            guard lower.hasPrefix("conti_utente_"), lower.hasSuffix(".enc") else { continue }
+            if lower.contains("_light") || lower.hasSuffix("_backup.enc") { continue }
+            if dropboxConflictedEncNamePatternMatches(url.lastPathComponent) { continue }
+            return url
+        }
+        return nil
+    }
+
+    public nonisolated static func lightEncURLIsInsideDataFolder(_ encURL: URL, folder: URL) -> Bool {
+        encURL.deletingLastPathComponent().standardizedFileURL.path
+            == folder.standardizedFileURL.path
+    }
+
     /// Un file `.key` nella cartella (preferenza `conti_di_casa.key`).
     public static func preferredKeyFileURL(inFolder folder: URL) -> URL? {
         let fm = FileManager.default
@@ -959,6 +1008,24 @@ nonisolated public enum ContiDatabase {
 
     private static func assertSafeToSave(_ encURL: URL) throws {
         let folder = encURL.deletingLastPathComponent().standardizedFileURL
+        let name = encURL.lastPathComponent.lowercased()
+        guard name.hasSuffix("_light.enc"),
+              !dropboxConflictedEncNamePatternMatches(encURL.lastPathComponent) else {
+            throw ContiLightImmissioneError.message(
+                "Salvataggio bloccato: si aggiorna solo il file *_light.enc della cartella dati, non un altro .enc."
+            )
+        }
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: folder.path, isDirectory: &isDir), isDir.boolValue else {
+            throw ContiLightImmissioneError.message(
+                "Salvataggio bloccato: la cartella del file light non esiste. Riseleziona Dropbox → ContiCursor."
+            )
+        }
+        guard folderLooksLikeDesktopDataFolder(folder) else {
+            throw ContiLightImmissioneError.message(
+                "Salvataggio bloccato: questo file non è nella cartella dati (servono conti_di_casa.key e il database completo nella stessa cartella). Tocca «Cambia cartella…» e apri Dropbox → ContiCursor. Non viene creato un .enc in un’altra cartella."
+            )
+        }
         try assertNoSessionWorkspaceLockBeforeOpen(in: folder)
         try assertNoDropboxConflictedEncFiles(in: folder)
     }
@@ -1541,7 +1608,7 @@ nonisolated public enum ContiDatabase {
         var absB = (0 ..< n).map { parseLooseDecimal(stringFromJSON(rowDicts[$0]["saldo_assoluto"])) ?? .zero }
         var dayB = (0 ..< n).map { parseLooseDecimal(stringFromJSON(rowDicts[$0]["saldo_alla_data"])) ?? .zero }
 
-        if boolFromJSON(record["is_cancelled"]) { return }
+        if boolFromJSON(record["is_cancelled"]) || boolFromJSON(record["is_virtuale_discharge"]) { return }
         let y = intFromJSON(record["year"])
         if isDotazioneRecord(record), y != legacyDotazioneYear { return }
 
@@ -2838,7 +2905,8 @@ nonisolated public enum ContiDatabase {
         amountText: String,
         chequeText: String,
         noteText: String,
-        lightRecordId: String
+        lightRecordId: String,
+        isVirtualeDischarge: Bool = false
     ) throws -> [String: Any] {
         let rid = lightRecordId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rid.isEmpty else {
@@ -2856,6 +2924,11 @@ nonisolated public enum ContiDatabase {
             throw ContiLightImmissioneError.message("Seleziona un conto.")
         }
         let girata = isGirataContoContoDisplayName(cat.displayName)
+        if isVirtualeDischarge, girata {
+            throw ContiLightImmissioneError.message(
+                "Durante lo scarico del saldo virtuale non è possibile registrare una Girata conto/conto."
+            )
+        }
         let acc2Trim = acc2Code.trimmingCharacters(in: .whitespacesAndNewlines)
         let acc2 = girata ? lists.conti.first(where: { $0.code == acc2Trim }) : nil
         if girata {
@@ -2885,10 +2958,16 @@ nonisolated public enum ContiDatabase {
         if girata, let a2f = acc2, accountCodeFrozenInDb(db: db, accountCode: a2f.code) {
             throw ContiLightImmissioneError.message("Uno dei conti selezionati è congelato: non è possibile registrare su quel conto.")
         }
-        let amt = try parseAmountForNewRecordImmissione(amountText: amountText, girata: girata)
+        var amt = try parseAmountForNewRecordImmissione(amountText: amountText, girata: girata)
+        if isVirtualeDischarge {
+            let residual = virtualeOpenResidual(from: db)
+            amt = virtualeCorrectClosingAmount(residual: residual, item: amt)
+        }
         let acc1IsCassa = acc1.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("cassa") == .orderedSame
+        let acc1IsVirtuale = acc1.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("VIRTUALE") == .orderedSame
+            || acc1.code.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("VIRTUALE") == .orderedSame
         let chqOut: String = {
-            if acc1IsCassa { return "-" }
+            if acc1IsCassa || acc1IsVirtuale { return "-" }
             if acc1.isCreditCard { return sanitizeLightImmissioneLine("ccarta", maxLen: maxChequeLen) }
             let t = sanitizeLightImmissioneLine(chequeText, maxLen: maxChequeLen).trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? "-" : t
@@ -2938,7 +3017,7 @@ nonisolated public enum ContiDatabase {
             "display_currency": "E",
             "display_amount": amtStr,
             "raw_record": "",
-            "is_virtuale_discharge": false,
+            "is_virtuale_discharge": isVirtualeDischarge,
             contiLightRecordIdKey: rid,
         ]
         return rec
@@ -3020,10 +3099,17 @@ nonisolated public enum ContiDatabase {
         let opts: JSONSerialization.WritingOptions = [.prettyPrinted]
         let jsonData = try JSONSerialization.data(withJSONObject: db, options: opts)
         let tokenUtf8 = try enc.encryptToUTF8String(plaintext: jsonData)
-        try FileManager.default.createDirectory(
-            at: encURL.deletingLastPathComponent(),
-            withIntermediateDirectories: true
-        )
+        let parent = encURL.deletingLastPathComponent()
+        if pathLooksUnderDropbox(encURL) {
+            var isDir: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: parent.path, isDirectory: &isDir), isDir.boolValue else {
+                throw ContiLightImmissioneError.message(
+                    "Cartella dati non trovata. Riseleziona Dropbox → ContiCursor. Il file .enc non viene creato in un’altra cartella."
+                )
+            }
+        } else {
+            try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        }
         guard let outData = tokenUtf8.data(using: .utf8) else { throw ContiDBError.cannotEncrypt }
         try writeDataPreservingCloudIdentity(outData, to: encURL)
     }
@@ -3062,8 +3148,24 @@ nonisolated public enum ContiDatabase {
     private static func writeBytesInPlace(_ data: Data, to writeURL: URL) throws {
         let fm = FileManager.default
         if !fm.fileExists(atPath: writeURL.path) {
-            try data.write(to: writeURL, options: [])
-            return
+            if pathLooksUnderDropbox(writeURL) {
+                // Dopo un evict il file manca in locale ma esiste sul cloud: riscaricare e sovrascrivere.
+                // Creare un file nuovo sul File Provider lo carica in una cartella Dropbox diversa.
+                try? fm.startDownloadingUbiquitousItem(at: writeURL)
+                let deadline = Date().addingTimeInterval(8)
+                while !fm.fileExists(atPath: writeURL.path), Date() < deadline {
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
+            }
+            if !fm.fileExists(atPath: writeURL.path) {
+                if pathLooksUnderDropbox(writeURL) {
+                    throw ContiLightImmissioneError.message(
+                        "Salvataggio bloccato: il file *_light.enc non è nella cartella dati. Non ne creo uno nuovo. Riseleziona Dropbox → ContiCursor e attendi la sincronizzazione."
+                    )
+                }
+                try data.write(to: writeURL, options: [])
+                return
+            }
         }
         do {
             let handle = try FileHandle(forWritingTo: writeURL)
@@ -3089,6 +3191,62 @@ nonisolated public enum ContiDatabase {
         FileManager.default.fileExists(atPath: pendingLightSessionEncURL().path)
     }
 
+    /// Registrazioni non ancora confermate dal Mac. Restano sul telefono, non su Dropbox.
+    public static func lanUnsentSessionEncURL() -> URL {
+        pendingLightSessionEncURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("lan_unsent_session.enc", isDirectory: false)
+    }
+
+    /// Ultimo elenco confermato dal Mac. Serve per aprire Light quando il Mac è spento.
+    public static func lanLastSessionEncURL() -> URL {
+        pendingLightSessionEncURL()
+            .deletingLastPathComponent()
+            .appendingPathComponent("lan_last_session.enc", isDirectory: false)
+    }
+
+    public static func saveLanLastSession(db: [String: Any], keyString: String) throws {
+        try writeFernetEncryptedDb(db: db, encURL: lanLastSessionEncURL(), keyString: keyString)
+    }
+
+    public static func loadLanLastSession(keyString: String) throws -> [String: Any]? {
+        let url = lanLastSessionEncURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        return try decryptPayload(encData: data, keyString: keyString, loginOnly: true)
+    }
+
+    private static var lanUnsentGeneration = 0
+
+    public static func saveLanUnsentSession(db: [String: Any], keyString: String) throws -> Int {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        lanUnsentGeneration += 1
+        let generation = lanUnsentGeneration
+        try writeFernetEncryptedDb(db: db, encURL: lanUnsentSessionEncURL(), keyString: keyString)
+        return generation
+    }
+
+    public static func lanUnsentGenerationNow() -> Int {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        return lanUnsentGeneration
+    }
+
+    public static func loadLanUnsentSession(keyString: String) throws -> [String: Any]? {
+        let url = lanUnsentSessionEncURL()
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let data = try Data(contentsOf: url)
+        return try decryptPayload(encData: data, keyString: keyString, loginOnly: true)
+    }
+
+    public static func removeLanUnsentSession(ifGeneration generation: Int) {
+        localInstanceMutex.lock()
+        defer { localInstanceMutex.unlock() }
+        guard generation == lanUnsentGeneration else { return }
+        try? FileManager.default.removeItem(at: lanUnsentSessionEncURL())
+    }
+
     /// Decifra la copia locale in sospeso. `nil` se il file non c’è.
     public static func loadPendingLightSessionDB(keyString: String) throws -> [String: Any]? {
         localInstanceMutex.lock()
@@ -3109,18 +3267,17 @@ nonisolated public enum ContiDatabase {
         return try decryptPayload(encData: data, keyString: keyString, loginOnly: true)
     }
 
-    /// La copia locale sostituisce il file Dropbox solo se è più recente (giorno del sidecar, poi data file).
-    /// Una sessione rimasta sul telefono da settimane non deve riscrivere il `*_light.enc` aggiornato dal desktop.
+    /// La copia locale va usata solo se il file sul telefono è più recente del `*_light.enc`.
+    /// Il giorno scritto in ``light_sidecar_generated_at`` resta quello dell’ultimo salvataggio desktop
+    /// e non dice se l’utente ha poi inserito registrazioni: si guarda la data del file locale.
+    /// Una copia più vecchia del file in cartella non viene riapplicata.
     public static func pendingLightSessionShouldReplaceCloud(
         cloudDB: [String: Any],
         pendingDB: [String: Any],
         cloudURL: URL
     ) -> Bool {
-        let cloudDay = lightSidecarGeneratedDay(cloudDB)
-        let pendingDay = lightSidecarGeneratedDay(pendingDB)
-        if let cloudDay, let pendingDay, pendingDay != cloudDay {
-            return pendingDay > cloudDay
-        }
+        _ = cloudDB
+        _ = pendingDB
         guard let pendingMtime = fileFingerprint(pendingLightSessionEncURL())?.mtime,
               let cloudMtime = fileFingerprint(cloudURL)?.mtime else {
             return false
@@ -3301,6 +3458,88 @@ nonisolated public enum ContiDatabase {
             .split { $0.isWhitespace }.map(String.init).joined(separator: " ")
     }
 
+    /// Residuo ancora da scaricare, con le stesse regole del Mac.
+    public static func virtualeOpenResidual(from db: [String: Any]) -> Decimal {
+        var records: [[String: Any]] = []
+        let years = db["years"] as? [[String: Any]] ?? []
+        for yd in years {
+            records.append(contentsOf: coerceToArrayOfStringKeyedDicts(yd["records"]))
+        }
+        records.sort { virtualeRecordSortKey($0) < virtualeRecordSortKey($1) }
+        var residual = Decimal.zero
+        for rec in records {
+            if boolFromJSON(rec["is_cancelled"]) { continue }
+            let src = virtualeSide(rec, which: "primary")
+            let dst = virtualeSide(rec, which: "secondary")
+            if boolFromJSON(rec["is_virtuale_discharge"]) {
+                if residual != 0 {
+                    let item = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+                    residual = virtualeApplyDischarge(residual, item: item)
+                }
+                continue
+            }
+            if residual == 0, isGirocontoRecord(rec), src != dst {
+                let amount = parseLooseDecimal(stringFromJSON(rec["amount_eur"])) ?? .zero
+                residual = src ? virtualeQuantize(amount) : virtualeQuantize(virtualeAbs(amount))
+            }
+        }
+        return virtualeQuantize(residual)
+    }
+
+    /// Se lo scarico finale ha il segno sbagliato, lo inverte così azzera il residuo.
+    public static func virtualeCorrectClosingAmount(residual: Decimal, item: Decimal) -> Decimal {
+        let r = virtualeQuantize(residual)
+        let a = virtualeQuantize(item)
+        if r == 0 || a == 0 { return a }
+        if virtualeAbs(a) != virtualeAbs(r) { return a }
+        if virtualeApplyDischarge(r, item: a) == 0 { return a }
+        let flipped = virtualeQuantize(-a)
+        if virtualeApplyDischarge(r, item: flipped) == 0 { return flipped }
+        return a
+    }
+
+    private static func virtualeRecordSortKey(_ rec: [String: Any]) -> (Int, Int, String, String, Int) {
+        let folder = stringFromJSON(rec["source_folder"])
+        let rank = folder == "APP" ? 1 : 0
+        return (
+            intFromJSON(rec["year"]),
+            rank,
+            rank == 0 ? folder : "",
+            rank == 0 ? stringFromJSON(rec["source_file"]) : "",
+            intFromJSON(rec["source_index"])
+        )
+    }
+
+    private static func virtualeSide(_ rec: [String: Any], which: String) -> Bool {
+        let name = stringFromJSON(rec["account_\(which)_name"]).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        let code = stringFromJSON(rec["account_\(which)_code"]).trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        return name == "VIRTUALE" || code == "VIRTUALE"
+    }
+
+    private static func virtualeQuantize(_ value: Decimal) -> Decimal {
+        var input = value
+        var result = Decimal()
+        NSDecimalRound(&result, &input, 2, .plain)
+        return result
+    }
+
+    private static func virtualeAbs(_ value: Decimal) -> Decimal {
+        value < 0 ? -value : value
+    }
+
+    private static func virtualeApplyDischarge(_ residual: Decimal, item: Decimal) -> Decimal {
+        let r = virtualeQuantize(residual)
+        let a = virtualeQuantize(item)
+        if r > 0 {
+            return virtualeQuantize(max(Decimal.zero, r - virtualeAbs(a)))
+        }
+        if r < 0 {
+            let next = virtualeQuantize(r + a)
+            return next > 0 ? Decimal.zero : next
+        }
+        return Decimal.zero
+    }
+
     /// True se la categoria (nome piano già «display») è «Girata conto/conto», come sul desktop.
     public static func isGirataContoContoDisplayName(_ displayName: String) -> Bool {
         let nn = normalizedCategorySortKey(displayName)
@@ -3417,6 +3656,15 @@ nonisolated public enum ContiDatabase {
             if a.name.lowercased() == "cassa" { return true }
             if b.name.lowercased() == "cassa" { return false }
             return a.name.localizedStandardCompare(b.name) == .orderedAscending
+        }
+        let hasVirtuale = conti.contains {
+            $0.name.localizedCaseInsensitiveCompare("VIRTUALE") == .orderedSame
+                || $0.code.localizedCaseInsensitiveCompare("VIRTUALE") == .orderedSame
+        }
+        if !hasVirtuale {
+            conti.append(
+                ContiImmissioneConto(code: "VIRTUALE", name: "VIRTUALE", isCreditCard: false, referenceAccountName: "")
+            )
         }
 
         return (categorie, conti)

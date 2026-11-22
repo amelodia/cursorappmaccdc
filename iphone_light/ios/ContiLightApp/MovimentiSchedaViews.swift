@@ -483,6 +483,8 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     let dataFolderURL: URL?
     let keyURL: URL?
     let lightEncURL: URL?
+    /// La riga va al Mac sulla rete locale, senza file Dropbox.
+    var savesOverLan: Bool = false
     let email: String
     let password: String
     let onPersisted: ([String: Any], [ContiRecordRow], String) -> Void
@@ -499,8 +501,11 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     @State private var noteText = ""
     @State private var isSaving = false
     @State private var showSaveConfirmDialog = false
-    @State private var showVirtualeSecondConfirm = false
     @State private var commitPreviewLine = ""
+    @State private var girataAccountRuleLock = false
+    @State private var lastGirataAccountTouched = "acc2"
+    @State private var virtualeDischargeActive = false
+    @State private var virtualeResidual: Decimal = 0
     @State private var pendingLightRecordId = ""
     @State private var showErrorAlert = false
     @State private var errorAlertMessage = ""
@@ -524,11 +529,34 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     }
 
     private var catRows: [(code: String, label: String, subtitle: String?)] {
-        (lists?.categorie ?? []).map { ($0.code, $0.displayName, nil) }
+        let all = lists?.categorie ?? []
+        let shown = virtualeDischargeActive && !isEditMode
+            ? all.filter { !ContiDatabase.isGirataContoContoDisplayName($0.displayName) }
+            : all
+        return shown.map { ($0.code, $0.displayName, nil) }
     }
 
-    private var accRows: [(code: String, label: String, subtitle: String?)] {
-        (lists?.conti ?? []).map { c in
+    private func isVirtualeConto(_ conto: ContiImmissioneConto?) -> Bool {
+        guard let conto else { return false }
+        let name = conto.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let code = conto.code.trimmingCharacters(in: .whitespacesAndNewlines)
+        return name.localizedCaseInsensitiveCompare("VIRTUALE") == .orderedSame
+            || code.localizedCaseInsensitiveCompare("VIRTUALE") == .orderedSame
+    }
+
+    /// Come sul Mac: VIRTUALE solo nella Girata, in ultima posizione. Fuori dalla Girata non compare.
+    private func girataConti(includeCreditCards: Bool) -> [ContiImmissioneConto] {
+        let all = lists?.conti ?? []
+        let virtuale = all.filter { isVirtualeConto($0) }
+        var rest = all.filter { !isVirtualeConto($0) }
+        if !includeCreditCards {
+            rest = rest.filter { !$0.isCreditCard }
+        }
+        return rest + virtuale
+    }
+
+    private func accountPickerRows(_ conti: [ContiImmissioneConto]) -> [(code: String, label: String, subtitle: String?)] {
+        conti.map { c in
             let sub: String?
             if c.isCreditCard {
                 sub = c.referenceAccountName.isEmpty
@@ -541,9 +569,27 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
     }
 
-    /// Girata conto/conto: il secondo conto non può essere carta (come sul desktop).
+    private var accRows: [(code: String, label: String, subtitle: String?)] {
+        if virtualeDischargeActive && !isEditMode {
+            return accountPickerRows((lists?.conti ?? []).filter { isVirtualeConto($0) })
+        }
+        let conti = girataSelected
+            ? girataConti(includeCreditCards: true)
+            : (lists?.conti ?? []).filter { !isVirtualeConto($0) }
+        return accountPickerRows(conti)
+    }
+
+    private var virtualeBalanceLine: String {
+        let shown = ContiDatabase.formatEuroTwoDecimals(virtualeResidual)
+        if virtualeResidual < 0 {
+            return "Saldo virtuale: \(shown) € (rimborso da splittare). Le voci positive lo riducono; le voci negative lo aumentano."
+        }
+        return "Saldo virtuale: \(shown) €. Registra per ridurre o scarica."
+    }
+
+    /// Girata: stesso elenco del primo conto, senza carte; VIRTUALE in fondo.
     private var accRowsGirataSecondo: [(code: String, label: String, subtitle: String?)] {
-        (lists?.conti ?? []).filter { !$0.isCreditCard }.map { ($0.code, $0.name, nil) }
+        accountPickerRows(girataConti(includeCreditCards: false))
     }
 
     private var selectedCatNote: String {
@@ -599,11 +645,6 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     private var acc2Label: String {
         if acc2Code.isEmpty { return "—" }
         return lists?.conti.first { $0.code == acc2Code }?.name ?? "—"
-    }
-
-    /// Richiede doppia conferma come sul desktop (conto Virtuale in prima o in girata).
-    private var virtualeInvolved: Bool {
-        acc1IsVirtuale || hasVirtualeInGirataPair
     }
 
     private var immissioneDateClosedRange: ClosedRange<Date> {
@@ -675,7 +716,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         } label: {
                             LabeledContent("Conto", value: acc1Label)
                         }
-                        .disabled(accRows.isEmpty)
+                        .disabled(accRows.isEmpty || (virtualeDischargeActive && !isEditMode))
 
                         if girataSelected {
                             NavigationLink {
@@ -725,6 +766,15 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                             .padding(.vertical, 6)
                             .background(Color.red.opacity(0.12))
                             .clipShape(RoundedRectangle(cornerRadius: 8))
+                        }
+                    }
+                    if virtualeDischargeActive && !isEditMode {
+                        Section {
+                            Text(virtualeBalanceLine)
+                                .font(.subheadline)
+                            Button("Scarica saldo virtuale") {
+                                amountText = virtualeClosingAmountText()
+                            }
                         }
                     }
                     if showAssegnoSection {
@@ -788,7 +838,9 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                         Text("NON CHIUDERE L’APP")
                             .font(.title3.weight(.bold))
                             .multilineTextAlignment(.center)
-                        Text("Salvataggio in corso sul file light (Dropbox).\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo.")
+                        Text(savesOverLan
+                             ? "Invio al Mac.\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo."
+                             : "Salvataggio in corso sul file light (Dropbox).\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo.")
                             .font(.subheadline)
                             .multilineTextAlignment(.center)
                         ProgressView()
@@ -812,8 +864,8 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 .accessibilityLabel("Avviso: non chiudere l’app. Salvataggio in corso.")
             }
         }
-        .interactiveDismissDisabled(isSaving)
-        .navigationBarBackButtonHidden(isSaving)
+        .interactiveDismissDisabled(isSaving || (virtualeDischargeActive && !isEditMode))
+        .navigationBarBackButtonHidden(isSaving || (virtualeDischargeActive && !isEditMode))
         .navigationTitle(isEditMode ? "Modifica registrazione" : "Nuove registrazioni")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
@@ -827,6 +879,9 @@ struct ContiLightNuovoMovimentoSchedaView: View {
             }
             syncChequeFromAcc1()
             applyGiroDefaultNoteIfNeeded()
+            if !isEditMode, let db = sessionDb {
+                applyDischargeMode(residual: ContiDatabase.virtualeOpenResidual(from: db))
+            }
         }
         .onChange(of: pickedDate) { _, d in
             dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(d))
@@ -837,6 +892,9 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 if !isG {
                     if noteText.trimmingCharacters(in: .whitespacesAndNewlines) == "Giroconto" {
                         noteText = ""
+                    }
+                    if isVirtualeConto(acc1Row), !virtualeDischargeActive {
+                        acc1Code = cassaAccountCode() ?? ""
                     }
                     acc2Code = ""
                 } else {
@@ -856,12 +914,21 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         .onChange(of: acc1Code) { _, _ in
             syncChequeFromAcc1()
             clearAcc2IfCreditCardInGirata()
+            guard !girataAccountRuleLock else { return }
+            lastGirataAccountTouched = "acc1"
+            enforceGirataVirtualeRules()
         }
         .onChange(of: acc2Code) { _, _ in
             guard girataSelected else { return }
-            if hasVirtualeInGirataPair, noteText.trimmingCharacters(in: .whitespacesAndNewlines) == "Giroconto" {
-                noteText = ""
+            let n = noteText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if hasVirtualeInGirataPair {
+                if n == "Giroconto" { noteText = "" }
+            } else if n.isEmpty || n == "-" {
+                noteText = "Giroconto"
             }
+            guard !girataAccountRuleLock else { return }
+            lastGirataAccountTouched = "acc2"
+            enforceGirataVirtualeRules()
         }
         .confirmationDialog(
             isEditMode ? "Confermare le modifiche?" : "Confermare l’inserimento?",
@@ -870,25 +937,10 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         ) {
             Button("Annulla", role: .cancel) {}
             Button(isEditMode ? "Salva" : "Inserisci") {
-                if virtualeInvolved {
-                    showVirtualeSecondConfirm = true
-                } else {
-                    performSave()
-                }
-            }
-        } message: {
-            Text(commitPreviewLine)
-        }
-        .alert("Registrazione con conto Virtuale", isPresented: $showVirtualeSecondConfirm) {
-            Button("Annulla", role: .cancel) {}
-            Button(isEditMode ? "Salva comunque" : "Inserisci comunque", role: .destructive) {
                 performSave()
             }
         } message: {
-            Text(
-                "Le registrazioni che coinvolgono il conto Virtuale non sono modificabili né eliminabili dal desktop. " +
-                    "Controlla bene i dati prima di proseguire."
-            )
+            Text(commitPreviewLine)
         }
         .alert("Impossibile salvare", isPresented: $showErrorAlert) {
             Button("OK", role: .cancel) {}
@@ -937,7 +989,8 @@ struct ContiLightNuovoMovimentoSchedaView: View {
     }
 
     private var canAttemptSave: Bool {
-        dataFolderURL != nil && keyURL != nil && lightEncURL != nil
+        if savesOverLan { return sessionDb != nil }
+        return dataFolderURL != nil && keyURL != nil && lightEncURL != nil
     }
 
     private func prepareCommitDialog() {
@@ -946,13 +999,13 @@ struct ContiLightNuovoMovimentoSchedaView: View {
             showErrorAlert = true
             return
         }
-        guard let k = keyURL, let e = lightEncURL, dataFolderURL != nil else {
-            errorAlertMessage = "Percorsi file non disponibili. Esci dall’area Movimenti e accedi di nuovo."
-            showErrorAlert = true
-            return
+        if !savesOverLan {
+            guard keyURL != nil, lightEncURL != nil, dataFolderURL != nil else {
+                errorAlertMessage = "Percorsi file non disponibili. Esci dall’area Movimenti e accedi di nuovo."
+                showErrorAlert = true
+                return
+            }
         }
-        _ = k
-        _ = e
         dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(pickedDate))
         if isEditMode {
             guard let lk = editingLegacyKey, !lk.isEmpty, !pendingLightRecordId.isEmpty else {
@@ -965,17 +1018,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
         do {
             let rid = pendingLightRecordId
-            let tpl = try ContiDatabase.buildNewLightRecordTemplate(
-                db: db,
-                catCode: catCode,
-                acc1Code: acc1Code,
-                acc2Code: acc2Code,
-                dateText: dateText,
-                amountText: amountText,
-                chequeText: chequeText,
-                noteText: noteText,
-                lightRecordId: rid
-            )
+            let tpl = try buildRecordTemplate(db: db, lightRecordId: rid)
             commitPreviewLine = commitPreview(from: tpl)
             showSaveConfirmDialog = true
         } catch {
@@ -994,14 +1037,27 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         var lines = ["Data \(d), \(cat), \(a1)"]
         if girataSelected, !a2.isEmpty, a2 != "—" { lines[0] += ", \(a2)" }
         lines.append("Importo (JSON): \(amt) EUR")
-        lines.append(
-            "La registrazione resta in questa sessione. Il file light su Dropbox si aggiorna una sola volta quando esci dall’app. Il completo si aggiorna sul desktop."
-        )
+        if savesOverLan {
+            lines.append("La registrazione viene inviata al Mac e resta sul telefono finché il Mac non conferma.")
+        } else {
+            lines.append(
+                "La registrazione resta in questa sessione. Il file light su Dropbox si aggiorna una sola volta quando esci dall’app. Il completo si aggiorna sul desktop."
+            )
+        }
         return lines.joined(separator: "\n")
     }
 
     private func performSave() {
-        guard let db = sessionDb, let folder = dataFolderURL, keyURL != nil, lightEncURL != nil else {
+        guard let db = sessionDb else {
+            errorAlertMessage = "Percorsi di salvataggio non disponibili."
+            showErrorAlert = true
+            return
+        }
+        if savesOverLan {
+            performLanSave(db: db)
+            return
+        }
+        guard let folder = dataFolderURL, keyURL != nil, lightEncURL != nil else {
             errorAlertMessage = "Percorsi di salvataggio non disponibili."
             showErrorAlert = true
             return
@@ -1024,17 +1080,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     return .failure(ContiLightImmissioneError.message("Impossibile accedere in scrittura alla cartella dati (permessi)."))
                 }
                 do {
-                    let tpl = try ContiDatabase.buildNewLightRecordTemplate(
-                        db: db,
-                        catCode: catCode,
-                        acc1Code: acc1Code,
-                        acc2Code: acc2Code,
-                        dateText: dateText,
-                        amountText: amountText,
-                        chequeText: chequeText,
-                        noteText: noteText,
-                        lightRecordId: rid
-                    )
+                    let tpl = try buildRecordTemplate(db: db, lightRecordId: rid)
                     var working = try ContiDatabase.deepCopyDb(db)
                     if let lk = optEdit {
                         try ContiDatabase.applyLightImmissioneUpdateInSession(
@@ -1059,13 +1105,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                 isSaving = false
                 switch result {
                 case .success(let pair):
-                    let rows = ContiDatabase.displayRecords(from: pair.sessionLight)
-                    onPersisted(pair.sessionLight, rows, pair.note)
-                    successAlertMessage = pair.note
-                    showSuccessAlert = true
-                    if isNewForm {
-                        clearForm()
-                    }
+                    finishSavedSession(pair.sessionLight, note: pair.note, isNewForm: isNewForm)
                 case .failure(let err):
                     if let ce = err as? ContiLightImmissioneError, case .message(let s) = ce {
                         errorAlertMessage = s
@@ -1080,8 +1120,75 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
     }
 
+    private func performLanSave(db: [String: Any]) {
+        dateText = ContiDatabase.italianDateDisplayFromIso(ContiDatabase.isoDateStringFromDateLocal(pickedDate))
+        let rid = pendingLightRecordId.isEmpty ? UUID().uuidString : pendingLightRecordId
+        pendingLightRecordId = rid
+        let optEdit = editingLegacyKey
+        let isNewForm = (optEdit == nil)
+        isSaving = true
+        let result: Result<(sessionLight: [String: Any], note: String), Error> = {
+            do {
+                let tpl = try buildRecordTemplate(db: db, lightRecordId: rid)
+                var working = try ContiDatabase.deepCopyDb(db)
+                if let lk = optEdit {
+                    try ContiDatabase.applyLightImmissioneUpdateInSession(
+                        db: &working,
+                        legacyKey: lk,
+                        recordFromTemplate: tpl
+                    )
+                } else {
+                    _ = try ContiDatabase.appendLightSessionRecord(db: &working, recordTemplate: tpl)
+                }
+                ContiDatabase.recomputeLightSaldiFromFullDb(&working)
+                let note = "Registrazione inviata al Mac. Resta sul telefono finché il Mac non conferma il salvataggio."
+                return .success((working, note))
+            } catch {
+                return .failure(error)
+            }
+        }()
+        isSaving = false
+        switch result {
+        case .success(let pair):
+            finishSavedSession(pair.sessionLight, note: pair.note, isNewForm: isNewForm)
+        case .failure(let err):
+            errorAlertMessage = (err as? LocalizedError)?.errorDescription ?? err.localizedDescription
+            showErrorAlert = true
+        }
+    }
+
     private func performDeleteRecord() {
-        guard let db = sessionDb, let folder = dataFolderURL, keyURL != nil, lightEncURL != nil, let lk = editingLegacyKey else {
+        guard let db = sessionDb, let lk = editingLegacyKey else {
+            errorAlertMessage = "Operazione non disponibile."
+            showErrorAlert = true
+            return
+        }
+        if savesOverLan {
+            isSaving = true
+            let result: Result<(sessionLight: [String: Any], note: String), Error> = {
+                do {
+                    var working = try ContiDatabase.deepCopyDb(db)
+                    try ContiDatabase.setSessionRecordCancelled(db: &working, legacyKey: lk, isCancelled: true)
+                    ContiDatabase.recomputeLightSaldiFromFullDb(&working)
+                    let note = "Annullamento inviato al Mac. Resta sul telefono finché il Mac non conferma."
+                    return .success((working, note))
+                } catch {
+                    return .failure(error)
+                }
+            }()
+            isSaving = false
+            switch result {
+            case .success(let pair):
+                let rows = ContiDatabase.displayRecords(from: pair.sessionLight)
+                onPersisted(pair.sessionLight, rows, pair.note)
+                dismiss()
+            case .failure(let err):
+                errorAlertMessage = (err as? LocalizedError)?.errorDescription ?? err.localizedDescription
+                showErrorAlert = true
+            }
+            return
+        }
+        guard let folder = dataFolderURL, keyURL != nil, lightEncURL != nil else {
             errorAlertMessage = "Operazione non disponibile."
             showErrorAlert = true
             return
@@ -1131,6 +1238,61 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         }
     }
 
+    private func buildRecordTemplate(db: [String: Any], lightRecordId: String) throws -> [String: Any] {
+        try ContiDatabase.buildNewLightRecordTemplate(
+            db: db,
+            catCode: catCode,
+            acc1Code: acc1Code,
+            acc2Code: acc2Code,
+            dateText: dateText,
+            amountText: amountText,
+            chequeText: chequeText,
+            noteText: noteText,
+            lightRecordId: lightRecordId,
+            isVirtualeDischarge: virtualeDischargeActive && !isEditMode && !girataSelected
+        )
+    }
+
+    private func finishSavedSession(_ session: [String: Any], note: String, isNewForm: Bool) {
+        let rows = ContiDatabase.displayRecords(from: session)
+        onPersisted(session, rows, note)
+        successAlertMessage = note
+        showSuccessAlert = true
+        guard isNewForm else { return }
+        let residual = ContiDatabase.virtualeOpenResidual(from: session)
+        virtualeResidual = residual
+        virtualeDischargeActive = residual != 0
+        clearForm()
+        if residual != 0 {
+            applyDischargeMode(residual: residual)
+        }
+    }
+
+    private func applyDischargeMode(residual: Decimal) {
+        virtualeResidual = residual
+        let active = residual != 0
+        virtualeDischargeActive = active
+        guard active, !isEditMode else { return }
+        if girataSelected || catCode.isEmpty {
+            if let consumi = lists?.categorie.first(where: {
+                ContiDatabase.normalizedCategorySortKey($0.displayName).contains("consumi ordinari")
+            }) ?? lists?.categorie.first(where: { !ContiDatabase.isGirataContoContoDisplayName($0.displayName) }) {
+                catCode = consumi.code
+            }
+        }
+        if let virtuale = lists?.conti.first(where: { isVirtualeConto($0) }) {
+            acc1Code = virtuale.code
+        }
+        acc2Code = ""
+        noteText = ""
+    }
+
+    private func virtualeClosingAmountText() -> String {
+        let need = -virtualeResidual
+        let body = ContiDatabase.formatEuroTwoDecimals(need < 0 ? -need : need)
+        return (need < 0 ? "-" : "+") + body
+    }
+
     private func setImmissioneSign(negative: Bool) {
         let t = ContiDatabase.normalizedEuroImmissioneAmountFieldText(amountText)
         var body = t
@@ -1172,6 +1334,25 @@ struct ContiLightNuovoMovimentoSchedaView: View {
 
     private func dismissNumericKeyboard() {
         UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+
+    private func cassaAccountCode() -> String? {
+        lists?.conti.first {
+            $0.name.trimmingCharacters(in: .whitespacesAndNewlines).localizedCaseInsensitiveCompare("cassa") == .orderedSame
+        }?.code
+    }
+
+    /// I due conti della girata non possono essere entrambi VIRTUALE: l’altro torna a Cassa.
+    private func enforceGirataVirtualeRules() {
+        guard girataSelected, !girataAccountRuleLock else { return }
+        guard isVirtualeConto(acc1Row), isVirtualeConto(acc2Row) else { return }
+        girataAccountRuleLock = true
+        if lastGirataAccountTouched == "acc1" {
+            acc2Code = cassaAccountCode() ?? ""
+        } else {
+            acc1Code = cassaAccountCode() ?? ""
+        }
+        girataAccountRuleLock = false
     }
 
     private func clearAcc2IfCreditCardInGirata() {

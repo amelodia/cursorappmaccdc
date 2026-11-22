@@ -17,6 +17,7 @@ from pathlib import Path
 _CONFIG_NAME = "data_workspace.json"
 
 _workspace_root: Path | None = None
+_isolated_process_workspace = False
 
 
 def app_install_dir() -> Path:
@@ -138,6 +139,8 @@ def _read_workspace_config() -> dict:
 
 
 def _write_workspace_config(obj: dict) -> None:
+    if _isolated_process_workspace:
+        return
     app_support_dir().mkdir(parents=True, exist_ok=True)
     workspace_config_path().write_text(
         json.dumps(obj, ensure_ascii=True, indent=2) + "\n",
@@ -204,8 +207,60 @@ def candidate_legacy_data_dirs() -> list[Path]:
     return out
 
 
+def process_workspace_override_path() -> Path | None:
+    """Cartella dati solo per questo processo (``CONTI_DATA_WORKSPACE``).
+
+    Non legge né scrive ``data_workspace.json``. Vuoto se la variabile non c'è.
+    """
+    raw = (os.environ.get("CONTI_DATA_WORKSPACE") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser().resolve()
+    if not path.is_dir() or not _is_valid_data_dir(path):
+        raise RuntimeError(
+            "CONTI_DATA_WORKSPACE non è una cartella dati valida (serve la cartella, "
+            "conti_di_casa.key e un database .enc):\n" + str(path)
+        )
+    saved = _saved_workspace_path_without_writing()
+    if saved is not None and saved == path:
+        raise RuntimeError(
+            "CONTI_DATA_WORKSPACE punta alla cartella dati operativa. "
+            "La prova deve usare un'altra cartella."
+        )
+    marker = path / "PROVA_ISOLATA.txt"
+    if not marker.is_file():
+        raise RuntimeError(
+            "CONTI_DATA_WORKSPACE rifiutata: manca PROVA_ISOLATA.txt. "
+            "Si avvia solo la cartella di prova, non un'altra copia dei dati.\n" + str(path)
+        )
+    return path
+
+
+def using_isolated_process_workspace() -> bool:
+    return _isolated_process_workspace
+
+
+def _saved_workspace_path_without_writing() -> Path | None:
+    obj, _src = _load_best_workspace_config()
+    raw = obj.get("workspace_path") or obj.get("path")
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        path = Path(raw).expanduser().resolve()
+    except OSError:
+        return None
+    return path if path.is_dir() else None
+
+
 def save_workspace_path(path: Path) -> None:
     path = path.expanduser().resolve()
+    if _isolated_process_workspace:
+        if _workspace_root is not None and path != _workspace_root.resolve():
+            raise RuntimeError(
+                "Sessione di prova: la cartella dati non si cambia e non viene registrata "
+                "per l'app di tutti i giorni."
+            )
+        return
     obj = _read_workspace_config()
     obj["workspace_path"] = str(path)
     _write_workspace_config(obj)
@@ -228,7 +283,13 @@ def save_last_login_email(email: str) -> None:
 
 def set_data_workspace_root(path: Path) -> None:
     global _workspace_root
-    _workspace_root = path.expanduser().resolve()
+    path = path.expanduser().resolve()
+    if _isolated_process_workspace and _workspace_root is not None and path != _workspace_root.resolve():
+        raise RuntimeError(
+            "Sessione di prova: la cartella dati resta quella di avvio. "
+            "L'app di tutti i giorni non viene reindirizzata."
+        )
+    _workspace_root = path
 
 
 def clear_workspace_configuration() -> None:
@@ -358,6 +419,13 @@ def configure_data_workspace_interactive(parent) -> bool:
     import security_auth
 
     dlg_parent = _visible_dialog_parent(parent)
+
+    override = process_workspace_override_path()
+    if override is not None:
+        global _isolated_process_workspace
+        _isolated_process_workspace = True
+        set_data_workspace_root(override)
+        return True
 
     saved = load_saved_workspace_path()
     if saved is not None:

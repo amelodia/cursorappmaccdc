@@ -114,8 +114,19 @@ struct ContentView: View {
     @State private var closeSessionWhenPersistEnds = false
     /// Registrazioni tenute in memoria: un solo aggiornamento di ``*_light.enc`` all’uscita, non uno per riga.
     @State private var lightDropboxDirty = false
+    @State private var lanKeyText = ""
+    @State private var lanDidClearPending = false
+    @State private var lanMacClosedNoticeShown = false
     /// Evict + riscaricamento `*_light.enc` da Dropbox/Files (login e tasto Allinea).
     @State private var isAligningCloud = false
+    /// Codice del primo accoppiamento. Dopo, il telefono rientra da solo.
+    @State private var provaCode = ""
+    @State private var provaLanActive = false
+    @State private var lanFingerprints: [String: String] = [:]
+    @State private var lanClient = ContiLanClient()
+    @State private var lanTokenKnown = false
+    @State private var lanNoticeText = ""
+    @State private var lanNoticePresented = false
 
     private enum MovimentiFiltriPick: Hashable {
         case category
@@ -141,6 +152,7 @@ struct ContentView: View {
                         dataFolderURL: dataFolderURL,
                         keyURL: sessionKeyURL,
                         lightEncURL: sessionLightEncURL,
+                        savesOverLan: provaLanActive,
                         email: email,
                         password: password,
                         onPersisted: { updatedDb, _, note in
@@ -153,6 +165,7 @@ struct ContentView: View {
                         dataFolderURL: dataFolderURL,
                         keyURL: sessionKeyURL,
                         lightEncURL: sessionLightEncURL,
+                        savesOverLan: provaLanActive,
                         email: email,
                         password: password,
                         onPersisted: { updatedDb, _, note in
@@ -174,12 +187,42 @@ struct ContentView: View {
         }
         .onAppear {
             if dataFolderURL == nil, let restored = ContiLightFolderBookmark.restore() {
-                dataFolderURL = restored
+                let access = restored.startAccessingSecurityScopedResource()
+                let reject = access ? ContiDatabase.rejectReasonIfNotDesktopDataFolder(restored) : nil
+                if access { restored.stopAccessingSecurityScopedResource() }
+                if let reject {
+                    ContiLightFolderBookmark.clear()
+                    message = reject
+                } else {
+                    dataFolderURL = restored
+                }
             }
             applySavedLoginEmailIfNeeded()
             refreshKeyStatus()
+            Task { lanTokenKnown = await lanClient.hasSavedToken() }
+        }
+        .task(id: provaLanActive) {
+            guard provaLanActive else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(4))
+                guard !Task.isCancelled, provaLanActive else { continue }
+                await pollLanRevision()
+            }
         }
         .onChange(of: scenePhase) { _, phase in
+            if provaLanActive {
+                if phase == .active {
+                    closeSessionWhenPersistEnds = false
+                    Task { @MainActor in
+                        await refreshLanIfLoggedIn(quiet: true)
+                    }
+                } else if phase == .background {
+                    Task { @MainActor in
+                        await flushLanIfDirty()
+                    }
+                }
+                return
+            }
             if phase == .active, dataFolderURL != nil {
                 closeSessionWhenPersistEnds = false
                 refreshKeyStatus()
@@ -228,6 +271,11 @@ struct ContentView: View {
         } message: {
             Text(periodicStartupAlertText)
         }
+        .alert("Sincronizzazione", isPresented: $lanNoticePresented) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(lanNoticeText)
+        }
     }
 
     /// Se `EuroBrand` non è nel target, mostra un’icona SF Symbol (evita build/runtime fragili).
@@ -252,22 +300,10 @@ struct ContentView: View {
     private var loginFootnoteText: String {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return message }
-        if dataFolderURL == nil {
-            return """
-            Tocca «Scegli cartella…», in basso a sinistra «Sfoglia», poi Dropbox → ContiCursor \
-            (la cartella dei file dati del desktop: .key e *_light.enc). \
-            Non usare la cartella ContiLight (è solo il progetto Xcode). \
-            Non toccare i singoli file: premi «Apri» sulla cartella ContiCursor.
-            """
+        if !lanTokenKnown {
+            return "Al primo collegamento inserisci email, password e il codice di 6 cifre mostrato da Conti di casa sul Mac, acceso sulla stessa rete Wi-Fi."
         }
-        let folderName = dataFolderURL?.lastPathComponent ?? ""
-        if folderName.compare("ContiCursor", options: [.caseInsensitive, .diacriticInsensitive]) != .orderedSame {
-            return """
-            La cartella memorizzata è «\(folderName)». I file dati stanno in Dropbox/ContiCursor, \
-            non in ContiLight. Tocca «Cambia cartella…» e apri ContiCursor.
-            """
-        }
-        return "Cartella ContiCursor memorizzata. Inserisci email e password, poi tocca Accedi."
+        return "Inserisci email e password. Conti Light si collega al Mac acceso sulla stessa rete Wi-Fi."
     }
 
     private var loginForm: some View {
@@ -292,7 +328,7 @@ struct ContentView: View {
                     .submitLabel(.next)
                 SecureField("Password", text: $password)
                     .submitLabel(.go)
-                    .onSubmit { loginWithPassword() }
+                    .onSubmit { loginWithProvaLan() }
                 if ContiLightBiometricLogin.biometricsAvailable() {
                     Toggle(
                         "Salva password per \(ContiLightBiometricLogin.biometricLabel())",
@@ -300,7 +336,7 @@ struct ContentView: View {
                     )
                     .font(.subheadline)
                 }
-                if ContiLightBiometricLogin.isConfigured(forEmail: email), dataFolderURL != nil {
+                if ContiLightBiometricLogin.isConfigured(forEmail: email) {
                     Button(action: loginWithBiometrics) {
                         HStack {
                             if isBusy {
@@ -315,7 +351,7 @@ struct ContentView: View {
                     }
                     .disabled(isBusy || isAligningCloud)
                 }
-                Button(action: loginWithPassword) {
+                Button(action: { loginWithProvaLan() }) {
                     HStack {
                         if isBusy {
                             ProgressView()
@@ -324,88 +360,20 @@ struct ContentView: View {
                     }
                     .frame(maxWidth: .infinity)
                 }
-                .disabled(isBusy || isAligningCloud || dataFolderURL == nil || email.isEmpty || password.isEmpty)
-            }
-            if dataFolderURL == nil {
-                Section("Cartella dati") {
-                    Text(
-                        "Nel selettore: Sfoglia → Dropbox → ContiCursor. " +
-                            "È la stessa cartella del desktop (conti_di_casa.key e *_light.enc). " +
-                            "Non aprire ContiLight (progetto Xcode) e non selezionare un file .enc."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    Button("Scegli cartella…") {
-                        folderPickRequest = FolderPickRequest()
-                    }
+                .disabled(
+                    isBusy || isAligningCloud || email.isEmpty || password.isEmpty
+                        || (provaCode.count != 6 && !lanTokenKnown)
+                )
+                if !lanTokenKnown {
+                    TextField("Codice di 6 cifre", text: $provaCode)
+                        .keyboardType(.numberPad)
                 }
-            } else {
-                Section("Posizione dati") {
-                    LabeledContent("Cartella") {
-                        Text(dataFolderURL?.lastPathComponent ?? "—")
-                            .lineLimit(2)
-                            .multilineTextAlignment(.trailing)
-                    }
-                    if !keyStatusText.isEmpty {
-                        Text(keyStatusText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if !lightFileStatusText.isEmpty {
-                        Text(lightFileStatusText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    if !fullFileStatusText.isEmpty {
-                        Text(fullFileStatusText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(
-                        "Controlla che il nome cartella sia ContiCursor. " +
-                            "La data «aggiornato» è la copia vista da File (non dall’app Dropbox). " +
-                            "Se non coincide, tocca «Allinea file con Dropbox» oppure «Cambia cartella…» e riseleziona ContiCursor, poi Accedi."
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    Button {
-                        Task { await alignLightFileFromCloud() }
-                    } label: {
-                        HStack {
-                            if isAligningCloud {
-                                ProgressView()
-                            }
-                            Text(isAligningCloud ? "Allineamento Dropbox…" : "Allinea file con Dropbox")
+                if lanTokenKnown {
+                    Button("Dimentica l'accoppiamento") {
+                        Task {
+                            await lanClient.forgetPairing()
+                            lanTokenKnown = false
                         }
-                    }
-                    .disabled(isBusy || isAligningCloud)
-                    Button("Cambia cartella…") {
-                        folderPickRequest = FolderPickRequest()
-                    }
-                    Button("Apri il file light aggiornato…") {
-                        lightFilePickRequest = FolderPickRequest()
-                    }
-                    .disabled(isBusy || isAligningCloud)
-                    Text(
-                        "Se l’unico file light senza «conflicted copy» è vecchio di settimane, " +
-                            "l’app File sta mostrando la copia locale, non il file aggiornato su Dropbox. " +
-                            "Nell’app Dropbox: Account → Impostazioni → File → Integrazione nativa con l’app File → " +
-                            "Converti tutto all’integrazione classica. Poi in Conti Light tocca «Cambia cartella…», " +
-                            "riapri ContiCursor e Accedi. Il messaggio di accesso indica la data dei dati aperti."
-                    )
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    Button("Rimuovi cartella salvata", role: .destructive) {
-                        if let picked = pickedLightEncURL {
-                            picked.stopAccessingSecurityScopedResource()
-                        }
-                        pickedLightEncURL = nil
-                        ContiLightFolderBookmark.clear()
-                        dataFolderURL = nil
-                        keyStatusText = ""
-                        lightFileStatusText = ""
-                        fullFileStatusText = ""
-                        message = ""
                     }
                 }
             }
@@ -437,8 +405,22 @@ struct ContentView: View {
                             message = "Accesso al file negato. Riprova dal selettore."
                             return
                         }
+                        let parent = url.deletingLastPathComponent()
+                        guard ContiDatabase.folderLooksLikeDesktopDataFolder(parent) else {
+                            url.stopAccessingSecurityScopedResource()
+                            message = """
+                            «\(name)» non è nella cartella dati. \
+                            Apri Dropbox → ContiCursor e scegli il *_light.enc accanto a conti_di_casa.key.
+                            """
+                            return
+                        }
+                        if parent.standardizedFileURL.path != dataFolderURL?.standardizedFileURL.path {
+                            ContiLightFolderBookmark.save(parent)
+                            dataFolderURL = parent
+                            refreshKeyStatus()
+                        }
                         pickedLightEncURL = url
-                        message = "File scelto: \(name). Tocca Accedi."
+                        message = "File scelto: \(name), cartella «\(parent.lastPathComponent)». Tocca Accedi."
                     }
                 },
                 onCancel: {
@@ -778,7 +760,11 @@ struct ContentView: View {
         }
         .listStyle(.insetGrouped)
         .refreshable {
-            await refreshLightSessionIfLoggedIn(forceReResolveEnc: true, forceCloudRedownload: true)
+            if provaLanActive {
+                await refreshLanIfLoggedIn()
+            } else {
+                await refreshLightSessionIfLoggedIn(forceReResolveEnc: true, forceCloudRedownload: true)
+            }
         }
         .navigationTitle("Movimenti")
         .navigationBarTitleDisplayMode(.inline)
@@ -821,7 +807,11 @@ struct ContentView: View {
                 .accessibilityLabel("Saldi")
                 Button {
                     Task { @MainActor in
-                        await refreshLightSessionIfLoggedIn(forceReResolveEnc: true, forceCloudRedownload: true)
+                        if provaLanActive {
+                            await refreshLanIfLoggedIn()
+                        } else {
+                            await refreshLightSessionIfLoggedIn(forceReResolveEnc: true, forceCloudRedownload: true)
+                        }
                     }
                 } label: {
                     if isRefreshingSession {
@@ -831,7 +821,7 @@ struct ContentView: View {
                     }
                 }
                 .disabled(isRefreshingSession || isBusy)
-                .accessibilityLabel("Aggiorna dati dal file")
+                .accessibilityLabel("Aggiorna dal Mac")
             }
         }
         .sheet(isPresented: $showFiltriSheet) {
@@ -983,6 +973,166 @@ struct ContentView: View {
         }
     }
 
+    private func loginWithProvaLan() {
+        guard !isBusy else { return }
+        let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        email = emailTrim
+        password = passwordTrim
+        guard !emailTrim.isEmpty, !passwordTrim.isEmpty else { return }
+        isBusy = true
+        message = "Apro l'elenco…"
+        let code = provaCode
+        Task { @MainActor in
+            let opened = await openProvaFromLastSession(emailTrim: emailTrim, passwordTrim: passwordTrim)
+            isBusy = false
+            if opened {
+                await syncProvaAfterOpen(code: code, emailTrim: emailTrim, passwordTrim: passwordTrim)
+                return
+            }
+            isBusy = true
+            message = "Primo collegamento: cerco il Mac…"
+            defer { isBusy = false }
+            do {
+                let light = try await lanClient.pairAndPull(code: code)
+                guard ContiDatabase.tryLogin(db: light, email: emailTrim, password: passwordTrim) != nil else {
+                    message = "Password non riconosciuta sul Mac."
+                    return
+                }
+                await adoptMacLight(light, emailTrim: emailTrim, fresh: true)
+            } catch {
+                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                message = "Per la prima apertura il Mac deve essere acceso. \(detail)"
+            }
+        }
+    }
+
+    /// Dopo l'apertura, allinea l'elenco con il Mac senza tenere ferma la schermata di accesso.
+    private func syncProvaAfterOpen(code: String, emailTrim: String, passwordTrim: String) async {
+        message = "Sincronizzo con il Mac…"
+        do {
+            let light = try await lanClient.pairAndPull(code: code)
+            guard ContiDatabase.tryLogin(db: light, email: emailTrim, password: passwordTrim) != nil else {
+                message = "Password non riconosciuta sul Mac."
+                return
+            }
+            await adoptMacLight(light, emailTrim: emailTrim, fresh: false)
+        } catch {
+            if isMacAppClosed(error) {
+                if lightDropboxDirty {
+                    await flushLanIfDirty()
+                }
+                message = macClosedSyncMessage
+                if !lanMacClosedNoticeShown {
+                    lanMacClosedNoticeShown = true
+                    lanNoticeText = macClosedSyncMessage
+                    lanNoticePresented = true
+                }
+                return
+            }
+            message = "Mac spento. L'elenco resta quello del telefono."
+            lanNoticeText = "Mac spento. Le registrazioni nuove restano sul telefono e si inviano quando il Mac è acceso."
+            lanNoticePresented = true
+        }
+    }
+
+    private func adoptMacLight(_ light: [String: Any], emailTrim: String, fresh: Bool) async {
+        ContiLightLastLoginEmail.save(emailTrim)
+        provaLanActive = true
+        lastScenePhaseRefreshAt = Date()
+        if fresh {
+            movimentiPath = NavigationPath()
+            filterCategoryKey = ""
+            filterAccountKey = ""
+        }
+        var session = light
+        var stillUnsent = false
+        var sentCount = 0
+        let previousMac = lanFingerprints
+        let key = await lanClient.encryptionKey()
+        lanKeyText = key
+        if !key.isEmpty, let pending = try? ContiDatabase.loadLanUnsentSession(keyString: key) {
+            let applied = ContiLanClient.applyingUnsent(pending, onto: light)
+            if applied.unsent.isEmpty {
+                ContiDatabase.removeLanUnsentSession(ifGeneration: ContiDatabase.lanUnsentGenerationNow())
+            } else {
+                do {
+                    session = try await lanClient.push(records: applied.unsent)
+                    ContiDatabase.removeLanUnsentSession(ifGeneration: ContiDatabase.lanUnsentGenerationNow())
+                    sentCount = applied.unsent.count
+                } catch {
+                    session = applied.merged
+                    stillUnsent = true
+                }
+            }
+        }
+        loggedInSessionDb = session as NSDictionary
+        sessionKeyURL = nil
+        sessionLightEncURL = nil
+        lightDropboxDirty = stillUnsent
+        lanFingerprints = ContiLanClient.fingerprints(of: stillUnsent ? light : session)
+        loggedInRecords = ContiDatabase.displayRecords(from: session, sort: movimentiListSort)
+        movimentiDisplayName = ContiDatabase.displayNameForHeader(db: session, email: emailTrim)
+        rememberLanSnapshot(stillUnsent ? light : session)
+        let fromMac = ContiLanClient.changedCount(
+            from: previousMac,
+            to: ContiLanClient.fingerprints(of: light)
+        )
+        if stillUnsent {
+            message = "Registrazioni ancora solo sul telefono. Si inviano quando il Mac risponde."
+            lanNoticeText = "Le registrazioni immesse col Mac spento sono ancora sul telefono."
+        } else {
+            message = "Collegato al Mac."
+            lanNoticeText = ContiLanClient.exchangeNotice(toPhone: fromMac, toMac: sentCount)
+            await lanClient.reportExchange(toPhone: fromMac, toMac: sentCount)
+        }
+        lanNoticePresented = true
+        lanTokenKnown = await lanClient.hasSavedToken()
+    }
+
+    /// Apre l'ultimo elenco tenuto sul telefono se il Mac non risponde.
+    private func openProvaFromLastSession(emailTrim: String, passwordTrim: String) async -> Bool {
+        let key = await lanClient.encryptionKey()
+        guard !key.isEmpty else { return false }
+        lanKeyText = key
+        let last = try? ContiDatabase.loadLanLastSession(keyString: key)
+        let pending = try? ContiDatabase.loadLanUnsentSession(keyString: key)
+        let base = last ?? pending
+        guard let base else { return false }
+        let applied = last.flatMap { confirmed in
+            pending.map { ContiLanClient.applyingUnsent($0, onto: confirmed) }
+        }
+        let session = applied?.merged ?? base
+        let unsent = applied?.unsent ?? []
+        guard ContiDatabase.tryLogin(db: session, email: emailTrim, password: passwordTrim) != nil else {
+            return false
+        }
+        let stillUnsent = !unsent.isEmpty || (last == nil && pending != nil)
+        ContiLightLastLoginEmail.save(emailTrim)
+        provaLanActive = true
+        lastScenePhaseRefreshAt = Date()
+        movimentiPath = NavigationPath()
+        filterCategoryKey = ""
+        filterAccountKey = ""
+        loggedInSessionDb = session as NSDictionary
+        sessionKeyURL = nil
+        sessionLightEncURL = nil
+        lightDropboxDirty = stillUnsent
+        lanFingerprints = ContiLanClient.fingerprints(of: last ?? [:])
+        loggedInRecords = ContiDatabase.displayRecords(from: session, sort: movimentiListSort)
+        movimentiDisplayName = ContiDatabase.displayNameForHeader(db: session, email: emailTrim)
+        message = "Elenco del telefono."
+        lanNoticePresented = false
+        lanTokenKnown = await lanClient.hasSavedToken()
+        return true
+    }
+
+    private func rememberLanSnapshot(_ db: [String: Any]) {
+        let key = lanKeyText
+        guard !key.isEmpty else { return }
+        try? ContiDatabase.saveLanLastSession(db: db, keyString: key)
+    }
+
     private func loginWithPassword() {
         guard let folder = dataFolderURL else { return }
         guard !isBusy else { return }
@@ -1012,41 +1162,135 @@ struct ContentView: View {
 
     /// Accesso con Face ID / Touch ID: recupera la password dal Keychain dopo il prompt biometrico.
     private func loginWithBiometrics() {
-        guard let folder = dataFolderURL else { return }
         guard !isBusy else { return }
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         email = emailTrim
         guard !emailTrim.isEmpty else { return }
-
         isBusy = true
         message = "Autenticazione…"
         Task { @MainActor in
-            defer { isBusy = false }
-            let passwordTrim: String
             do {
-                passwordTrim = try ContiLightBiometricLogin.loadPasswordUnlockingWithBiometrics(email: emailTrim)
+                password = try ContiLightBiometricLogin.loadPasswordUnlockingWithBiometrics(email: emailTrim)
             } catch {
+                isBusy = false
                 message = (error as NSError).localizedDescription
                 return
             }
-            password = passwordTrim
-            // Dopo Face ID: lettura/decifratura file, eventuale attesa sincronizzazione (Dropbox) e merge DB.
-            message = "Attendere un momento, per favore"
-            let packet = await runLoginPacket(
-                emailTrim: emailTrim,
-                passwordTrim: passwordTrim,
-                folderURL: folder,
-                lightEncURLIfKnown: pickedLightEncURL,
-                forceCloudRedownload: true
-            )
-            applyLoginPacket(packet, emailTrim: emailTrim, passwordTrim: passwordTrim)
+            isBusy = false
+            loginWithProvaLan()
         }
     }
 
     /// Ricarica silenziosamente il file light dalla cartella (stesso compito del tasto Aggiorna quando `forceReResolveEnc` è attivo).
     /// Default: risolve di nuovo il path `*_light.enc` (Importo allineato al file su disco dopo sync Dropbox / Files).
     /// `forceCloudRedownload`: scarta la copia File Provider e riscarica (Aggiorna / pull); non usarlo a ogni ritorno in primo piano.
+    private func pollLanRevision() async {
+        guard provaLanActive, !isBusy, !isRefreshingSession else { return }
+        if lightDropboxDirty {
+            await flushLanIfDirty()
+        }
+        await refreshLanIfLoggedIn(quiet: true)
+    }
+
+    private func refreshLanIfLoggedIn(quiet: Bool = false) async {
+        guard provaLanActive, loggedInSessionDb != nil, !isBusy, !isRefreshingSession else { return }
+        isRefreshingSession = true
+        defer { isRefreshingSession = false }
+        do {
+            let previousShown = ContiLanClient.fingerprints(
+                of: (loggedInSessionDb as? [String: Any]) ?? [:]
+            )
+            let light = try await lanClient.pull(quiet: quiet)
+            var session = light
+            if lightDropboxDirty, !lanKeyText.isEmpty,
+               let pending = try? ContiDatabase.loadLanUnsentSession(keyString: lanKeyText) {
+                let applied = ContiLanClient.applyingUnsent(pending, onto: light)
+                session = applied.merged
+                if applied.unsent.isEmpty {
+                    lightDropboxDirty = false
+                    ContiDatabase.removeLanUnsentSession(ifGeneration: ContiDatabase.lanUnsentGenerationNow())
+                }
+            }
+            if !lightDropboxDirty, !lanDidClearPending {
+                lanDidClearPending = await lanClient.clearPendingNotice()
+            }
+            let fromMac = ContiLanClient.changedCount(
+                from: lanFingerprints,
+                to: ContiLanClient.fingerprints(of: light)
+            )
+            let shown = ContiLanClient.fingerprints(of: session)
+            lastScenePhaseRefreshAt = Date()
+            lanFingerprints = ContiLanClient.fingerprints(of: light)
+            if fromMac > 0 || !quiet {
+                lanNoticeText = ContiLanClient.exchangeNotice(toPhone: fromMac, toMac: 0)
+                lanNoticePresented = true
+                await lanClient.reportExchange(toPhone: fromMac, toMac: 0)
+            }
+            guard shown != previousShown else { return }
+            loggedInSessionDb = session as NSDictionary
+            loggedInRecords = ContiDatabase.displayRecords(from: session, sort: movimentiListSort)
+            movimentiDisplayName = ContiDatabase.displayNameForHeader(db: session, email: email)
+            rememberLanSnapshot(light)
+        } catch {
+            if !quiet {
+                message = "Mac non raggiungibile. Le registrazioni restano sul telefono."
+            }
+        }
+    }
+
+    private func flushLanIfDirty() async {
+        guard provaLanActive, lightDropboxDirty, var db = loggedInSessionDb as? [String: Any] else { return }
+        let generation = ContiDatabase.lanUnsentGenerationNow()
+        let dirty = ContiLanClient.dirtyRecords(in: &db, baseline: lanFingerprints)
+        loggedInSessionDb = db as NSDictionary
+        if dirty.isEmpty {
+            ContiDatabase.removeLanUnsentSession(ifGeneration: generation)
+            if ContiDatabase.lanUnsentGenerationNow() == generation {
+                lightDropboxDirty = false
+                lanFingerprints = ContiLanClient.fingerprints(of: db)
+            }
+            return
+        }
+        do {
+            let light = try await lanClient.push(records: dirty)
+            if ContiDatabase.lanUnsentGenerationNow() == generation {
+                loggedInSessionDb = light as NSDictionary
+                loggedInRecords = ContiDatabase.displayRecords(from: light, sort: movimentiListSort)
+                lanFingerprints = ContiLanClient.fingerprints(of: light)
+                ContiDatabase.removeLanUnsentSession(ifGeneration: generation)
+                lightDropboxDirty = false
+                rememberLanSnapshot(light)
+            }
+            message = "Salvate sul Mac."
+            lanNoticeText = ContiLanClient.exchangeNotice(toPhone: 0, toMac: dirty.count)
+            lanNoticePresented = true
+            lanMacClosedNoticeShown = false
+        } catch {
+            if isMacAppClosed(error) {
+                message = macClosedSyncMessage
+                if !lanMacClosedNoticeShown {
+                    lanMacClosedNoticeShown = true
+                    lanNoticeText = macClosedSyncMessage
+                    lanNoticePresented = true
+                }
+                return
+            }
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            message = "Registrazioni ancora solo sul telefono. \(detail)"
+        }
+    }
+
+    private var macClosedSyncMessage: String {
+        "Il Mac è chiuso. Le registrazioni restano sul telefono. Alla riapertura, se Light è chiusa, il Mac avvisa di riaprirla."
+    }
+
+    private func isMacAppClosed(_ error: Error) -> Bool {
+        let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        return detail.contains("app_chiusa")
+    }
+
     private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = true, forceCloudRedownload: Bool = false) async {
+        if provaLanActive { return }
         guard loggedInSessionDb != nil, let folder = dataFolderURL else { return }
         let emailTrim = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let passwordTrim = password.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1054,6 +1298,9 @@ struct ContentView: View {
         guard !emailTrim.isEmpty, !passwordTrim.isEmpty else { return }
         guard !isBusy, !isRefreshingSession else { return }
 
+        // Non sostituire la lista con il file Dropbox finché le registrazioni di questa sessione
+        // non sono state scritte: al ritorno in primo piano sparirebbero.
+        if lightDropboxDirty { return }
         isRefreshingSession = true
         defer { isRefreshingSession = false }
 
@@ -1110,7 +1357,9 @@ struct ContentView: View {
 
     private func closeCurrentSessionAndReleaseLock() {
         releaseSessionLockIfOwned()
+        provaLanActive = false
         lightDropboxDirty = false
+        lanKeyText = ""
         loggedInSessionDb = nil
         loggedInRecords = []
         movimentiDisplayName = ""
@@ -1121,6 +1370,26 @@ struct ContentView: View {
 
     /// Tiene la sessione in memoria e ne fa una copia cifrata fuori da Dropbox.
     private func rememberSessionForDropboxFlush(_ db: [String: Any], note: String) {
+        if provaLanActive {
+            loggedInSessionDb = db as NSDictionary
+            loggedInRecords = ContiDatabase.displayRecords(from: db, sort: movimentiListSort)
+            lightDropboxDirty = true
+            message = note
+            if !lanKeyText.isEmpty {
+                _ = try? ContiDatabase.saveLanUnsentSession(db: db, keyString: lanKeyText)
+            }
+            Task { @MainActor in
+                if lanKeyText.isEmpty {
+                    let key = await lanClient.encryptionKey()
+                    lanKeyText = key
+                    if !key.isEmpty {
+                        _ = try? ContiDatabase.saveLanUnsentSession(db: db, keyString: key)
+                    }
+                }
+                await flushLanIfDirty()
+            }
+            return
+        }
         loggedInSessionDb = db as NSDictionary
         loggedInRecords = ContiDatabase.displayRecords(from: db, sort: movimentiListSort)
         lightDropboxDirty = true
@@ -1154,19 +1423,42 @@ struct ContentView: View {
                 }
                 var wrote = false
                 if access {
+                    let target: URL? = {
+                        if let canonical = ContiDatabase.resolvePrimaryEncURL(inFolder: folder, email: emailTrim),
+                           ContiDatabase.lightEncURLIsInsideDataFolder(canonical, folder: folder) {
+                            return canonical
+                        }
+                        if ContiDatabase.lightEncURLIsInsideDataFolder(enc, folder: folder) {
+                            return enc
+                        }
+                        return nil
+                    }()
                     do {
+                        guard let target else {
+                            throw ContiLightImmissioneError.message(
+                                "Salvataggio bloccato: il file light non è nella cartella dati. Riseleziona Dropbox → ContiCursor."
+                            )
+                        }
                         _ = try ContiDatabase.persistSessionDbToEncryptedFiles(
                             sessionDb: db,
                             recordForSaldi: [:],
-                            lightEncURL: enc,
+                            lightEncURL: target,
                             keyURL: key,
                             email: emailTrim,
                             password: passwordTrim
                         )
                         ContiDatabase.removePendingLightSession(ifGeneration: generationAtStart)
                         wrote = true
+                        DispatchQueue.main.async {
+                            self.sessionLightEncURL = target
+                        }
                     } catch {
                         wrote = false
+                        _ = try? ContiDatabase.savePendingLightSession(db: db, keyURL: key)
+                        let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                        DispatchQueue.main.async {
+                            self.message = "Registrazioni non scritte su Dropbox. \(detail)"
+                        }
                     }
                 }
                 DispatchQueue.main.async {
@@ -1191,9 +1483,12 @@ struct ContentView: View {
         await withCheckedContinuation { (cont: CheckedContinuation<LoginResultPacket, Never>) in
             DispatchQueue.global(qos: .userInitiated).async {
                 let folderAccess = folderURL.startAccessingSecurityScopedResource()
+                var renewBookmark = true
                 defer {
                     if folderAccess {
-                        ContiLightFolderBookmark.renew(from: folderURL)
+                        if renewBookmark {
+                            ContiLightFolderBookmark.renew(from: folderURL)
+                        }
                         folderURL.stopAccessingSecurityScopedResource()
                     }
                 }
@@ -1229,6 +1524,20 @@ struct ContentView: View {
                         return
                     }
                 }
+                if let reject = ContiDatabase.rejectReasonIfNotDesktopDataFolder(folderURL) {
+                    renewBookmark = false
+                    ContiLightFolderBookmark.clear()
+                    packet = LoginResultPacket(
+                        message: reject,
+                        records: [],
+                        sessionDb: nil,
+                        keyURL: nil,
+                        lightEncURL: nil,
+                        periodicStartupMessage: nil
+                    )
+                    cont.resume(returning: packet)
+                    return
+                }
                 guard let keyRef = ContiDatabase.preferredKeyFileURL(inFolder: folderURL) else {
                     packet = LoginResultPacket(
                         message: "Nessun file .key nella cartella. Copia qui conti_di_casa.key (stesso del desktop).",
@@ -1243,8 +1552,11 @@ struct ContentView: View {
                 }
                 // Il segnaposto si controlla in ``acquireSessionWorkspaceLockForOpen`` (stesso criteri «materiato»/scrittura).
                 var encRef: URL
-                if let known = lightEncURLIfKnown {
-                    encRef = known
+                let knownInFolder = lightEncURLIfKnown.flatMap { known -> URL? in
+                    ContiDatabase.lightEncURLIsInsideDataFolder(known, folder: folderURL) ? known : nil
+                }
+                if let knownInFolder {
+                    encRef = knownInFolder
                 } else if let resolved = ContiDatabase.resolvePrimaryEncURL(inFolder: folderURL, email: emailTrim) {
                     encRef = resolved
                 } else if let any = ContiDatabase.lightFileCandidates(inFolder: folderURL, email: emailTrim).first {
@@ -1265,13 +1577,16 @@ struct ContentView: View {
                     cont.resume(returning: packet)
                     return
                 }
-                let fullEncURL = ContiDatabase.perUserEncURL(primaryEnc: encRef, email: emailTrim)
+                let fullEncURL = folderURL.standardizedFileURL.appendingPathComponent(
+                    "\(ContiDatabase.userEncFilenameStem(forEmail: emailTrim)).enc",
+                    isDirectory: false
+                )
                 let cloudWait = ContiDatabase.requestFreshCloudMaterialization(
                     of: encRef,
-                    forceEvict: forceCloudRedownload && lightEncURLIfKnown == nil
+                    forceEvict: forceCloudRedownload && knownInFolder == nil
                 )
                 let lightSize = (try? FileManager.default.attributesOfItem(atPath: encRef.path)[.size] as? NSNumber)?.int64Value ?? 0
-                if forceCloudRedownload, lightEncURLIfKnown == nil, lightSize <= 0,
+                if forceCloudRedownload, knownInFolder == nil, lightSize <= 0,
                    ContiDatabase.lightFileCandidates(inFolder: folderURL, email: emailTrim).isEmpty {
                     packet = LoginResultPacket(
                         message: """
@@ -1305,9 +1620,9 @@ struct ContentView: View {
 
                 do {
                     let keyString = try ContiDatabase.coordinatedStringContents(of: keyRef, encoding: .utf8)
-                    let pickedAccess = lightEncURLIfKnown?.startAccessingSecurityScopedResource() ?? false
+                    let pickedAccess = knownInFolder?.startAccessingSecurityScopedResource() ?? false
                     defer {
-                        if pickedAccess, let known = lightEncURLIfKnown {
+                        if pickedAccess, let known = knownInFolder {
                             known.stopAccessingSecurityScopedResource()
                         }
                     }
@@ -1315,26 +1630,51 @@ struct ContentView: View {
                         inFolder: folderURL,
                         email: emailTrim,
                         keyString: keyString,
-                        preferredURL: lightEncURLIfKnown
+                        preferredURL: knownInFolder
                     )
                     encRef = freshest.url
+                    if let canonical = ContiDatabase.resolvePrimaryEncURL(inFolder: folderURL, email: emailTrim),
+                       ContiDatabase.lightEncURLIsInsideDataFolder(canonical, folder: folderURL) {
+                        encRef = canonical
+                    }
                     var db = freshest.db
                     let day = freshest.generatedDay ?? "sconosciuta"
-                    sourceNote = "Aperto \(freshest.url.lastPathComponent), dati del \(day)."
+                    sourceNote = "Aperto \(encRef.lastPathComponent), dati del \(day)."
                     if ContiDatabase.pendingLightSessionExists() {
                         do {
-                            if let pendingDB = try ContiDatabase.loadPendingLightSessionDB(keyString: keyString),
-                               ContiDatabase.pendingLightSessionShouldReplaceCloud(
-                                   cloudDB: db,
-                                   pendingDB: pendingDB,
-                                   cloudURL: encRef
-                               ) {
-                                try ContiDatabase.writePendingLightSessionIfPresent(to: encRef)
-                                db = pendingDB
-                                pendingFlushNote = "Scritte su Dropbox le registrazioni rimaste in sospeso dalla sessione precedente."
-                            } else {
-                                ContiDatabase.quarantineStalePendingLightSession()
-                                pendingFlushNote = "Sul telefono c’era una copia locale più vecchia del file Dropbox: non l’ho usata. Apro il file aggiornato."
+                            if let pendingDB = try ContiDatabase.loadPendingLightSessionDB(keyString: keyString) {
+                                let pendingNewer = ContiDatabase.pendingLightSessionShouldReplaceCloud(
+                                    cloudDB: db,
+                                    pendingDB: pendingDB,
+                                    cloudURL: encRef
+                                )
+                                var merged = db
+                                let recovered = pendingNewer
+                                    ? ContiDatabase.mergeLightNewRecordsIntoMain(main: &merged, light: pendingDB)
+                                    : 0
+                                if recovered > 0 {
+                                    db = merged
+                                    do {
+                                        _ = try ContiDatabase.persistSessionDbToEncryptedFiles(
+                                            sessionDb: db,
+                                            recordForSaldi: [:],
+                                            lightEncURL: encRef,
+                                            keyURL: keyRef,
+                                            email: emailTrim,
+                                            password: passwordTrim
+                                        )
+                                        ContiDatabase.removePendingLightSession(
+                                            ifGeneration: ContiDatabase.pendingLightGenerationNow()
+                                        )
+                                        pendingFlushNote = recovered == 1
+                                            ? "La registrazione inserita in questa app è stata scritta nel file light della cartella dati."
+                                            : "Le \(recovered) registrazioni inserite in questa app sono state scritte nel file light della cartella dati."
+                                    } catch {
+                                        pendingFlushNote = "Le registrazioni inserite in questa app restano sul telefono e non sono ancora nel file Dropbox. \(error.localizedDescription)"
+                                    }
+                                } else {
+                                    ContiDatabase.quarantineStalePendingLightSession()
+                                }
                             }
                         } catch {
                             pendingFlushNote = "Copia locale in sospeso non applicata, uso il file Dropbox. \(error.localizedDescription)"

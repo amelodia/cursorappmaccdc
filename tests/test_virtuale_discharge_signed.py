@@ -17,6 +17,7 @@ from main_app import (  # noqa: E402
     virtuale_correct_closing_item,
     virtuale_nonzero_startup_message,
     virtuale_opening_residual,
+    virtuale_open_residual_from_records,
     virtuale_replace_discharge_item,
 )
 
@@ -113,6 +114,49 @@ class VirtualeDischargeSignedTests(unittest.TestCase):
         self.assertEqual(need, Decimal("47.50"))
         self.assertEqual(saved, Decimal("47.50"))
         self.assertEqual(after, Decimal("0.00"))
+
+    def test_cancelling_closing_discharge_reopens_residual(self) -> None:
+        records = [
+            {
+                "year": 2026,
+                "source_folder": "APP",
+                "source_file": "manual",
+                "source_index": 1,
+                "category_name": "-GIRATA CONTO/CONTO",
+                "account_primary_name": "CARTA",
+                "account_primary_code": "10",
+                "account_secondary_name": "VIRTUALE",
+                "account_secondary_code": "VIRTUALE",
+                "amount_eur": "-52.80",
+                "is_cancelled": False,
+                "is_virtuale_discharge": False,
+            },
+            {
+                "year": 2026,
+                "source_folder": "APP",
+                "source_file": "manual",
+                "source_index": 2,
+                "category_name": "-VESTITI",
+                "account_primary_name": "VIRTUALE",
+                "account_primary_code": "VIRTUALE",
+                "amount_eur": "-39.90",
+                "is_cancelled": False,
+                "is_virtuale_discharge": True,
+            },
+            {
+                "year": 2026,
+                "source_folder": "APP",
+                "source_file": "manual",
+                "source_index": 3,
+                "category_name": "-VESTITI",
+                "account_primary_name": "VIRTUALE",
+                "account_primary_code": "VIRTUALE",
+                "amount_eur": "-12.90",
+                "is_cancelled": True,
+                "is_virtuale_discharge": True,
+            },
+        ]
+        self.assertEqual(virtuale_open_residual_from_records(records), Decimal("12.90"))
 
     def test_startup_message_covers_negative_residual(self) -> None:
         msg_neg = virtuale_nonzero_startup_message(Decimal("-12.30"))

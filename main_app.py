@@ -441,7 +441,9 @@ def window_title_for_session(
         suf = (up.get("display_name_suffix") or "").strip()
         base = f"Conti di casa {suf} — {d}" if suf else f"Conti di casa — {d}"
     if show_clock:
-        return f"{base} · {datetime.now().strftime('%H.%M.%S')}"
+        base = f"{base} · {datetime.now().strftime('%H.%M.%S')}"
+    if data_workspace.using_isolated_process_workspace():
+        return f"PROVA — {base}"
     return base
 
 
@@ -658,25 +660,57 @@ def bind_return_tab_and_kp_enter(widget: tk.Misc, callback: Callable[..., object
     widget.bind("<Tab>", callback, add=add)
 
 
-def read_virtuale_saldo() -> Decimal:
-    """Saldo virtuale residuo da scaricare (persistente tra sessioni; può essere negativo per i rimborsi)."""
+def _virtuale_saldo_path() -> Path:
+    """Nella sessione di prova il residuo resta nella cartella di prova."""
+    if data_workspace.using_isolated_process_workspace():
+        try:
+            return data_workspace.data_dir() / "_support_prova" / "memoria_cassa.json"
+        except RuntimeError:
+            pass
+    return DEFAULT_VIRTUALE_SALDO_FILE
+
+
+def read_virtuale_sidecar() -> tuple[Decimal, bool]:
+    """Residuo e segno di azzeramento di emergenza.
+
+    L'emergenza lascia il file a zero con ``emergency_hold``: le registrazioni già
+    inserite non riaprono il residuo. Uno zero normale cancella il file.
+    """
+    path = _virtuale_saldo_path()
     try:
-        if DEFAULT_VIRTUALE_SALDO_FILE.exists():
-            return Decimal(str(json.loads(DEFAULT_VIRTUALE_SALDO_FILE.read_text(encoding="utf-8")).get("euro", "0")))
+        if path.exists():
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            euro = Decimal(str(raw.get("euro", "0"))).quantize(Decimal("0.01"))
+            return euro, bool(raw.get("emergency_hold"))
     except Exception:
         pass
-    return Decimal("0")
+    return Decimal("0.00"), False
 
 
-def write_virtuale_saldo(value: Decimal) -> None:
+def read_virtuale_saldo() -> Decimal:
+    """Saldo virtuale residuo da scaricare (persistente tra sessioni; può essere negativo per i rimborsi)."""
+    euro, _hold = read_virtuale_sidecar()
+    return euro
+
+
+def virtuale_emergency_hold() -> bool:
+    _euro, hold = read_virtuale_sidecar()
+    return hold
+
+
+def write_virtuale_saldo(value: Decimal, *, emergency_hold: bool = False) -> None:
+    path = _virtuale_saldo_path()
     try:
-        DEFAULT_VIRTUALE_SALDO_FILE.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         v = value.quantize(Decimal("0.01"))
-        if v == 0:
-            if DEFAULT_VIRTUALE_SALDO_FILE.exists():
-                DEFAULT_VIRTUALE_SALDO_FILE.unlink()
+        if v == 0 and not emergency_hold:
+            if path.exists():
+                path.unlink()
         else:
-            DEFAULT_VIRTUALE_SALDO_FILE.write_text(json.dumps({"euro": str(v)}), encoding="utf-8")
+            payload: dict[str, object] = {"euro": str(v)}
+            if emergency_hold:
+                payload["emergency_hold"] = True
+            path.write_text(json.dumps(payload), encoding="utf-8")
     except Exception:
         pass
 
@@ -758,6 +792,65 @@ def virtuale_nonzero_startup_message(residual: Decimal) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _lan_records_touch_virtuale(records: list) -> bool:
+    """True se una riga arrivata dal telefono apre o modifica il saldo virtuale."""
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("is_virtuale_discharge"):
+            return True
+        src, dst = record_virtuale_sides(rec)
+        if src or dst:
+            return True
+    return False
+
+
+def record_virtuale_sides(rec: dict) -> tuple[bool, bool]:
+    """(primo conto è VIRTUALE, secondo conto è VIRTUALE)."""
+
+    def _side(which: str) -> bool:
+        name = str(rec.get(f"account_{which}_name") or "").strip().upper()
+        code = str(rec.get(f"account_{which}_code") or "").strip().upper()
+        return name == VIRTUALE_ACCOUNT_NAME or code == VIRTUALE_ACCOUNT_NAME
+
+    return _side("primary"), _side("secondary")
+
+
+def virtuale_open_residual_from_records(records: list[dict]) -> Decimal:
+    """Residuo ancora da scaricare, ricalcolato dalle registrazioni non annullate.
+
+    Una girata con un solo conto VIRTUALE apre il residuo. Gli scarichi lo riducono.
+    Se lo scarico che lo aveva azzerato viene annullato, il residuo si riapre.
+    """
+    ordered = sorted(records, key=record_merge_sort_key)
+    residual = Decimal("0.00")
+    for rec in ordered:
+        if rec.get("is_cancelled"):
+            continue
+        src, dst = record_virtuale_sides(rec)
+        if rec.get("is_virtuale_discharge"):
+            if residual != 0:
+                residual = virtuale_apply_discharge(residual, to_decimal(rec.get("amount_eur") or "0"))
+            continue
+        if residual == 0 and is_giroconto_record(rec) and (src ^ dst):
+            residual = virtuale_opening_residual(
+                to_decimal(rec.get("amount_eur") or "0"),
+                virtuale_is_source=src,
+            )
+    return residual.quantize(Decimal("0.01"))
+
+
+def reconcile_virtuale_saldo(db: dict) -> Decimal:
+    """Allinea il file del residuo alle registrazioni, salvo dopo l'azzeramento di emergenza."""
+    if virtuale_emergency_hold():
+        return read_virtuale_saldo()
+    records = [r for y in db.get("years") or [] for r in y.get("records") or []]
+    computed = virtuale_open_residual_from_records(records)
+    if computed != read_virtuale_saldo():
+        write_virtuale_saldo(computed)
+    return computed
 
 
 def virtuale_replace_discharge_item(residual: Decimal, old_item: Decimal, new_item: Decimal) -> Decimal:
@@ -5694,7 +5787,9 @@ def _apply_macos_tk_iconphoto(app_root: tk.Misc | None) -> None:
     if app_root is None or platform.system() != "Darwin":
         return
     try:
-        photo = getattr(app_root, "_cdc_tk_dock_photo", None)
+        isolated = data_workspace.using_isolated_process_workspace()
+        photo_attr = "_cdc_tk_dock_photo_prova" if isolated else "_cdc_tk_dock_photo"
+        photo = getattr(app_root, photo_attr, None)
         if photo is None:
             import base64
             from io import BytesIO
@@ -5703,7 +5798,10 @@ def _apply_macos_tk_iconphoto(app_root: tk.Misc | None) -> None:
 
             from euro_login_asset import EURO_JPEG_B64
 
-            raw = base64.standard_b64decode(EURO_JPEG_B64)
+            if isolated:
+                raw = _prova_icon_png_bytes()
+            else:
+                raw = base64.standard_b64decode(EURO_JPEG_B64)
             if not raw:
                 return
             im = Image.open(BytesIO(raw)).convert("RGBA")
@@ -5713,10 +5811,55 @@ def _apply_macos_tk_iconphoto(app_root: tk.Misc | None) -> None:
                 resample = Image.LANCZOS
             im.thumbnail((256, 256), resample)
             photo = ImageTk.PhotoImage(im, master=app_root)
-            app_root._cdc_tk_dock_photo = photo  # type: ignore[attr-defined]
+            setattr(app_root, photo_attr, photo)
         app_root.iconphoto(True, photo)
     except Exception:
         return
+
+
+def _prova_icon_png_bytes() -> bytes | None:
+    """Moneta euro con fascia arancione «PROVA»: solo il Dock della sessione di prova."""
+    cached = getattr(_prova_icon_png_bytes, "_png", None)
+    if isinstance(cached, bytes):
+        return cached
+    try:
+        import base64
+        from io import BytesIO
+
+        from PIL import Image, ImageDraw, ImageFont
+
+        from euro_login_asset import EURO_JPEG_B64
+    except Exception:
+        return None
+    try:
+        im = Image.open(BytesIO(base64.standard_b64decode(EURO_JPEG_B64))).convert("RGBA")
+        im = im.resize((256, 256))
+        draw = ImageDraw.Draw(im)
+        orange = (214, 78, 0, 255)
+        draw.polygon([(0, 0), (128, 0), (0, 128)], fill=orange)
+        draw.rectangle((0, 176, 256, 256), fill=orange)
+        font = None
+        for path, size in (
+            ("/System/Library/Fonts/Supplemental/Arial Bold.ttf", 42),
+            ("/Library/Fonts/Arial Bold.ttf", 42),
+            ("/System/Library/Fonts/Helvetica.ttc", 42),
+        ):
+            try:
+                font = ImageFont.truetype(path, size)
+                break
+            except OSError:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        draw.text((64, 64), "P", fill=(255, 255, 255, 255), anchor="mm", font=font)
+        draw.text((128, 216), "PROVA", fill=(255, 255, 255, 255), anchor="mm", font=font)
+        out = BytesIO()
+        im.save(out, format="PNG")
+        png = out.getvalue()
+    except Exception:
+        return None
+    setattr(_prova_icon_png_bytes, "_png", png)
+    return png
 
 
 def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = None) -> None:
@@ -5733,8 +5876,10 @@ def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = No
     if os.environ.get("CONTI_SKIP_DOCK_NATIVE", "").strip().lower() in ("1", "true", "yes", "on", "si"):
         return
     app_root = _macos_tk_app_root(tk_anchor)
+    isolated = data_workspace.using_isolated_process_workspace()
     _apply_macos_tk_iconphoto(app_root)
-    cached = getattr(app_root, "_cdc_appkit_dock_icon", None) if app_root is not None else None
+    cache_attr = "_cdc_appkit_dock_icon_prova" if isolated else "_cdc_appkit_dock_icon"
+    cached = getattr(app_root, cache_attr, None) if app_root is not None else None
     if cached is not None:
         try:
             from AppKit import NSApplication
@@ -5755,13 +5900,18 @@ def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = No
     except Exception:
         return
     try:
-        raw = base64.standard_b64decode(EURO_JPEG_B64)
-        if not raw:
-            return
-        im = Image.open(BytesIO(raw)).convert("RGBA")
-        png_io = BytesIO()
-        im.save(png_io, format="PNG")
-        png_bytes = png_io.getvalue()
+        if isolated:
+            png_bytes = _prova_icon_png_bytes()
+            if not png_bytes:
+                return
+        else:
+            raw = base64.standard_b64decode(EURO_JPEG_B64)
+            if not raw:
+                return
+            im = Image.open(BytesIO(raw)).convert("RGBA")
+            png_io = BytesIO()
+            im.save(png_io, format="PNG")
+            png_bytes = png_io.getvalue()
         buf = NSData.dataWithBytes_length_(png_bytes, len(png_bytes))
         img = NSImage.alloc().initWithData_(buf)
         if img is None:
@@ -5769,9 +5919,9 @@ def apply_macos_dock_icon_from_login_euro_jpeg(*, tk_anchor: tk.Misc | None = No
         NSApplication.sharedApplication().setApplicationIconImage_(img)
         if app_root is not None:
             # Ancora riferimento su oggetto Tcl: evita finalizzazione PyObjC precoce del NSImage.
-            app_root._cdc_appkit_dock_icon = img  # type: ignore[attr-defined]
+            setattr(app_root, cache_attr, img)
         elif tk_anchor is not None:
-            tk_anchor._cdc_appkit_dock_icon = img  # type: ignore[attr-defined]
+            setattr(tk_anchor, cache_attr, img)
     except Exception:
         return
 
@@ -9448,6 +9598,12 @@ def filter_and_sort_movements_for_grid(
 
 
 def _user_library_conti_support_dir() -> Path:
+    if data_workspace.using_isolated_process_workspace():
+        try:
+            # Copie di sicurezza e pre-salvataggi della prova: mai nella Library operativa.
+            return data_workspace.data_dir() / "_support_prova"
+        except RuntimeError:
+            pass
     if platform.system() == "Windows":
         base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or "").strip()
         if base:
@@ -10037,6 +10193,12 @@ def save_encrypted_db_dual(
     )
 
     _assert_safe_to_save(primary_output_path)
+    try:
+        import light_enc_sidecar as _lec_pre
+
+        _lec_pre.import_new_light_records_into_main(db, primary_output_path, key_path)
+    except Exception:
+        pass
     key = get_or_create_key(key_path)
     token = Fernet(key).encrypt(json.dumps(db, ensure_ascii=True, indent=2).encode("utf-8"))
 
@@ -10075,6 +10237,13 @@ def save_encrypted_db_dual(
         import light_enc_sidecar
 
         light_enc_sidecar.write_light_enc_sidecar(db, primary_output_path, key_path)
+    except Exception:
+        pass
+
+    try:
+        import light_lan_sync
+
+        light_lan_sync.bump_data_revision()
     except Exception:
         pass
 
@@ -10517,6 +10686,13 @@ def build_ui(
     # Riferimento mutabile: dopo import legacy da Opzioni, griglia e saldi devono usare il nuovo DB.
     _BANNER_CLOCK_LABELS.clear()
     db_holder: list[dict] = [db]
+    # La prova in rete locale deve scrivere lo stesso dizionario che mostra la finestra.
+    try:
+        setattr(root, "_cdc_db_holder", db_holder)
+        setattr(root, "_cdc_path_holder", path_holder)
+        setattr(root, "_cdc_key_path_holder", key_path_holder)
+    except Exception:
+        pass
     session_holder: list[security_auth.AppSession] = [session]
     periodiche.ensure_periodic_registrations(db_holder[0])
     email_client.ensure_email_settings(db_holder[0])
@@ -10714,6 +10890,7 @@ def build_ui(
 
     _is_macos_ui = platform.system() == "Darwin"
     main_nb_shell = tk.Frame(root, bg=MOVIMENTI_PAGE_BG)
+    setattr(root, "_cdc_main_shell", main_nb_shell)
     early_lbl = getattr(root, "_cdc_early_build_loading_label", None)
     if early_lbl is not None:
         try:
@@ -10734,6 +10911,7 @@ def build_ui(
         fill=tk.BOTH, expand=True, padx=8, pady=(18, 6) if _is_macos_ui else 8
     )
     cdc_tab_bar = tk.Frame(main_nb_shell, bg=MOVIMENTI_PAGE_BG)
+    setattr(root, "_cdc_tab_bar", cdc_tab_bar)
     cdc_tab_bar.pack(fill=tk.X, pady=(0, 2 if _is_macos_ui else 6))
     cdc_tab_bar.columnconfigure(0, weight=1)
     cdc_tab_bar.columnconfigure(2, weight=1)
@@ -13575,12 +13753,12 @@ th {{ background:#efefef; text-align:left; }}
         )
         if not ask:
             return
-        old_amt = to_decimal(rec.get("amount_eur") or "0")
         was_discharge = bool(rec.get("is_virtuale_discharge"))
+        virt_src, virt_dst = record_virtuale_sides(rec)
         rec["is_cancelled"] = True
-        if was_discharge:
-            _apply_virtuale_discharge_item_change(old_amt, Decimal("0"))
         persist_db_after_edit(None)
+        if was_discharge or virt_src or virt_dst:
+            _apply_virtuale_discharge_item_change(Decimal("0"), Decimal("0"), warn_if_reopened=True)
         if reg_n is not None:
             messagebox.showinfo("Registrazione eliminata", f"Registrazione {reg_n} annullata.")
 
@@ -13940,6 +14118,10 @@ th {{ background:#efefef; text-align:left; }}
         reselect_fallback_index: int | None = None,
         ensure_reselected_visible: bool = False,
     ) -> None:
+        try:
+            setattr(root, "_cdc_refresh_movements", populate_movements_trees)
+        except Exception:
+            pass
         nonlocal movements_population_seq
         movements_population_seq += 1
         token_local = movements_population_seq
@@ -16830,8 +17012,9 @@ th {{ background:#efefef; text-align:left; }}
     saldo_aggiorna_active: list[bool] = [False]
     saldo_aggiorna_locked: list[bool] = [False]
     # --- Saldo Virtuale (sostituisce la vecchia Memoria di cassa) ---
-    virtuale_saldo: list[Decimal] = [read_virtuale_saldo()]
-    virtuale_discharge_active: list[bool] = [read_virtuale_saldo() != Decimal("0")]
+    _virtuale_initial = reconcile_virtuale_saldo(cur_db())
+    virtuale_saldo: list[Decimal] = [_virtuale_initial]
+    virtuale_discharge_active: list[bool] = [_virtuale_initial != Decimal("0")]
     virtuale_display_var = tk.StringVar(value="")
     newreg_calendar_popup: list[tk.Toplevel | None] = [None]
     newreg_date_manual_mode: list[bool] = [False]
@@ -17816,19 +17999,90 @@ th {{ background:#efefef; text-align:left; }}
         else:
             _sync_tk_entry_from_stringvar(ent_amt, newreg_amount_var)
 
-    def _apply_virtuale_discharge_item_change(old_item: Decimal, new_item: Decimal) -> None:
-        """Allinea il residuo sidecar a una modifica/annullo di registrazione di scarico."""
-        if virtuale_saldo[0] == 0 and not virtuale_discharge_active[0]:
+    def _apply_virtuale_discharge_item_change(
+        old_item: Decimal,
+        new_item: Decimal,
+        *,
+        warn_if_reopened: bool = False,
+        modal_warning: bool = True,
+        switch_page: bool = True,
+    ) -> None:
+        """Ricalcola il residuo dalle registrazioni. L'azzeramento di emergenza non viene riaperto."""
+        del old_item, new_item
+        if virtuale_emergency_hold():
             return
-        nxt = virtuale_replace_discharge_item(virtuale_saldo[0], old_item, new_item)
+        prev = virtuale_saldo[0]
+        nxt = virtuale_open_residual_from_records(
+            [r for y in cur_db().get("years") or [] for r in y.get("records") or []]
+        )
         virtuale_saldo[0] = nxt
         write_virtuale_saldo(nxt)
         if nxt == 0:
             if virtuale_discharge_active[0]:
                 _exit_virtuale_discharge_mode()
             return
+        reopened = prev == 0 or warn_if_reopened
         virtuale_discharge_active[0] = True
         _refresh_virtuale_ui()
+        try:
+            _sync_cat_note_and_second_account()
+        except Exception:
+            pass
+        if not reopened:
+            return
+        if switch_page:
+            try:
+                notebook.select(nuovi_dati_frame)
+            except Exception:
+                pass
+            try:
+                _show_mode("new")
+            except Exception:
+                pass
+        if modal_warning:
+            messagebox.showwarning(
+                "Saldo virtuale non azzerato",
+                virtuale_nonzero_startup_message(nxt),
+                parent=root,
+            )
+
+    def _cdc_lan_virtuale_followup() -> None:
+        try:
+            _apply_virtuale_discharge_item_change(
+                Decimal("0"),
+                Decimal("0"),
+                warn_if_reopened=True,
+                modal_warning=False,
+                switch_page=False,
+            )
+        except Exception:
+            return
+        nxt = virtuale_saldo[0].quantize(Decimal("0.01"))
+
+        def _sync_notice() -> None:
+            show = getattr(root, "_cdc_show_virtuale_lan_notice", None)
+            hide = getattr(root, "_cdc_hide_virtuale_lan_notice", None)
+            if nxt == 0:
+                if callable(hide):
+                    hide()
+                return
+            if callable(show):
+                show(
+                    "Saldo virtuale non azzerato: "
+                    f"{format_euro_it(nxt)} €. "
+                    "Completa lo scarico su Conti Light. "
+                    "L'avviso si chiude quando il saldo torna a zero."
+                )
+
+        try:
+            root.after(400, _sync_notice)
+        except Exception:
+            pass
+
+    try:
+        setattr(root, "_cdc_after_lan_virtuale", _cdc_lan_virtuale_followup)
+    except Exception:
+        pass
 
     def _on_scarica_virtuale_click() -> None:
         m = virtuale_saldo[0].quantize(Decimal("0.01"))
@@ -36404,7 +36658,14 @@ tr.tot td {{ font-weight: 700; background: #f0f0f0; }}
             "Sei sicuro di voler procedere?",
         ):
             return
-        _exit_virtuale_discharge_mode()
+        virtuale_saldo[0] = Decimal("0")
+        virtuale_discharge_active[0] = False
+        write_virtuale_saldo(Decimal("0"), emergency_hold=True)
+        _refresh_virtuale_ui()
+        try:
+            _sync_cat_note_and_second_account()
+        except Exception:
+            pass
         _populate_form_defaults(keep_last=False)
         messagebox.showinfo("Saldo virtuale", "Saldo virtuale azzerato.")
 
@@ -37009,6 +37270,239 @@ def _confirm_dropbox_ready_after_recent_boot(root: tk.Tk) -> bool:
     return result[0]
 
 
+def _start_isolated_light_lan(root: tk.Tk) -> None:
+    """Ascolto per Conti Light, dopo l'accesso. L'icona di prova resta solo nella sessione isolata."""
+    if getattr(root, "_cdc_light_lan_started", False):
+        return
+    db_holder = getattr(root, "_cdc_db_holder", None)
+    path_holder = getattr(root, "_cdc_path_holder", None)
+    key_path_holder = getattr(root, "_cdc_key_path_holder", None)
+    if not db_holder or not path_holder or not key_path_holder:
+        return
+    import threading
+
+    import light_enc_sidecar
+    import light_lan_sync
+
+    setattr(root, "_cdc_light_lan_started", True)
+    status_var = tk.StringVar(value="Avvio dell'ascolto…")
+
+    def on_ui(fn):
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        box: dict = {}
+        done = threading.Event()
+
+        def wrap() -> None:
+            try:
+                box["v"] = fn()
+            except Exception as exc:
+                box["e"] = exc
+            finally:
+                done.set()
+
+        try:
+            root.after(0, wrap)
+        except tk.TclError as exc:
+            raise RuntimeError("applicazione chiusa") from exc
+        if not done.wait(120):
+            raise TimeoutError("la finestra non ha risposto")
+        if "e" in box:
+            raise box["e"]
+        return box["v"]
+
+    def snapshot() -> dict:
+        def work() -> dict:
+            light = light_enc_sidecar.build_light_database(db_holder[0])
+            # Stesso giro del filo principale: il numero e l'elenco non possono divergere.
+            light["_lan_revision"] = light_lan_sync.current_data_revision()
+            return light
+
+        return on_ui(work)
+
+    def apply_records(records: list) -> tuple[int, dict]:
+        def work() -> tuple[int, dict]:
+            light = light_lan_sync.light_db_from_records(records)
+            n_new, n_up = light_enc_sidecar.merge_light_sidecar_into_main(db_holder[0], light)
+            save_encrypted_db_dual(db_holder[0], path_holder[0], key_path_holder[0])
+            if _lan_records_touch_virtuale(records):
+                follow = getattr(root, "_cdc_after_lan_virtuale", None)
+                if callable(follow):
+                    try:
+                        follow()
+                    except Exception:
+                        pass
+            refresh = getattr(root, "_cdc_refresh_movements", None)
+            if callable(refresh):
+                try:
+                    refresh(preserve_scroll=True)
+                except Exception:
+                    pass
+            built = light_enc_sidecar.build_light_database(db_holder[0])
+            built["_lan_revision"] = light_lan_sync.current_data_revision()
+            return n_new + n_up, built
+
+        return on_ui(work)
+
+    notice_var = tk.StringVar(value="")
+    banner_parent = getattr(root, "_cdc_main_shell", None)
+    if banner_parent is None:
+        banner_parent = root
+    tab_bar = getattr(root, "_cdc_tab_bar", None)
+
+    def _show_banner(frame: tk.Frame) -> None:
+        """Riga normale della pagina: non copre righe e pulsanti e non sposta il puntatore."""
+        try:
+            if tab_bar is not None and int(tab_bar.winfo_exists()):
+                frame.pack(side=tk.TOP, fill=tk.X, before=tab_bar, padx=8, pady=(8, 0))
+            else:
+                frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(8, 0))
+        except tk.TclError:
+            pass
+
+    def _hide_banner(frame: tk.Frame) -> None:
+        try:
+            frame.pack_forget()
+        except tk.TclError:
+            pass
+
+    code_box = tk.Frame(
+        banner_parent,
+        bg="#FFF8F2",
+        highlightbackground="#E25A00",
+        highlightthickness=2,
+        padx=16,
+        pady=12,
+    )
+    if data_workspace.using_isolated_process_workspace():
+        tk.Label(
+            code_box,
+            text="VERSIONE DI PROVA",
+            font=("TkDefaultFont", 16, "bold"),
+            fg="#E25A00",
+            bg="#FFF8F2",
+        ).pack(anchor=tk.W)
+        tk.Label(
+            code_box,
+            text="Non è il programma di tutti i giorni.\nIl database operativo non è in ascolto.",
+            justify=tk.LEFT,
+            bg="#FFF8F2",
+        ).pack(anchor=tk.W, pady=(4, 0))
+    tk.Label(
+        code_box,
+        text="Codice da inserire su Conti Light",
+        font=("TkDefaultFont", 11),
+        bg="#FFF8F2",
+    ).pack(anchor=tk.W, pady=(12, 0))
+    code_value = tk.Label(code_box, text="", font=("TkFixedFont", 28, "bold"), bg="#FFF8F2")
+    code_value.pack(anchor=tk.W)
+    tk.Label(code_box, textvariable=status_var, justify=tk.LEFT, wraplength=410, bg="#FFF8F2").pack(
+        anchor=tk.W, pady=(8, 0)
+    )
+    tk.Button(code_box, text="Nascondi", command=lambda: _hide_banner(code_box)).pack(
+        anchor=tk.E, pady=(12, 0)
+    )
+
+    notice_box = tk.Frame(
+        banner_parent,
+        bg="#FFF8F2",
+        highlightbackground="#E25A00",
+        highlightthickness=3,
+        padx=22,
+        pady=18,
+    )
+    tk.Label(
+        notice_box,
+        textvariable=notice_var,
+        justify=tk.CENTER,
+        wraplength=420,
+        bg="#FFF8F2",
+        font=("TkDefaultFont", 13, "bold"),
+    ).pack(anchor=tk.CENTER)
+    tk.Button(notice_box, text="OK", command=lambda: _hide_notice()).pack(anchor=tk.CENTER, pady=(14, 0))
+
+    def _hide_notice() -> None:
+        try:
+            notice_box.place_forget()
+        except tk.TclError:
+            pass
+
+    def _show_virtuale_lan_notice(text: str) -> None:
+        _show_small_notice(text)
+
+    def _hide_virtuale_lan_notice() -> None:
+        if str(notice_var.get() or "").startswith("Saldo virtuale non azzerato"):
+            _hide_notice()
+
+    try:
+        setattr(root, "_cdc_show_virtuale_lan_notice", _show_virtuale_lan_notice)
+        setattr(root, "_cdc_hide_virtuale_lan_notice", _hide_virtuale_lan_notice)
+    except Exception:
+        pass
+
+    def _show_small_notice(text: str) -> None:
+        """Riquadro al centro della pagina, senza una finestra separata."""
+        current = str(notice_var.get() or "")
+        if current.startswith("Saldo virtuale non azzerato") and not str(text).startswith(
+            "Saldo virtuale non azzerato"
+        ):
+            return
+        notice_var.set(text)
+        _hide_banner(code_box)
+        try:
+            notice_box.place(relx=0.5, rely=0.5, anchor="center", width=480)
+            notice_box.lift()
+        except tk.TclError:
+            pass
+
+    def on_status(text: str) -> None:
+        def set_text() -> None:
+            try:
+                status_var.set(text)
+            except tk.TclError:
+                pass
+            if text.startswith("Codice di accoppiamento necessario"):
+                _show_banner(code_box)
+            elif (
+                text.startswith("Collegamento riuscito")
+                or text.startswith("Scambio riuscito")
+                or text.startswith("Da sincronizzare")
+            ):
+                _show_small_notice(text)
+
+        try:
+            root.after(0, set_text)
+        except tk.TclError:
+            pass
+
+    server = light_lan_sync.LightLanServer(
+        data_workspace.data_dir(),
+        key_path_holder[0],
+        snapshot=snapshot,
+        apply_records=apply_records,
+        on_status=on_status,
+    )
+    server.start()
+    atexit.register(server.stop)
+
+    def _warn_if_phone_waiting() -> None:
+        count = light_lan_sync.read_light_pending_count(data_workspace.data_dir())
+        if count <= 0:
+            return
+        on_status(
+            "Da sincronizzare: sull'iPhone ci sono registrazioni non ancora arrivate. "
+            "Conti Light è chiuso: riaprilo per sincronizzarle."
+        )
+
+    try:
+        root.after(12000, _warn_if_phone_waiting)
+    except tk.TclError:
+        pass
+    code_value.configure(text=server.pairing_code)
+    if not server.has_paired_phone():
+        _show_banner(code_box)
+
+
 def main() -> None:
     if Fernet is None:
         sys.exit(1)
@@ -37054,6 +37548,15 @@ def main() -> None:
         except Exception:
             pass
         return
+    if data_workspace.using_isolated_process_workspace():
+        try:
+            root.title("PROVA — Conti di casa")
+        except Exception:
+            pass
+        try:
+            apply_macos_dock_icon_from_login_euro_jpeg(tk_anchor=root)
+        except Exception:
+            pass
     data_dir = data_workspace.data_dir()
 
     if not _confirm_dropbox_ready_after_recent_boot(root):
@@ -37077,6 +37580,11 @@ def main() -> None:
         except Exception:
             pass
         return
+
+    import light_lan_sync
+
+    light_lan_sync.prepare_gui_listen(data_dir)
+    atexit.register(light_lan_sync.leave_notice_listener, data_dir)
 
     def _workspace_lock_heartbeat_tick() -> None:
         try:
@@ -37258,6 +37766,10 @@ def main() -> None:
         session.is_registered = bool(
             (db_holder[0].get("user_profile") or {}).get("registration_verified")
         )
+    try:
+        root.after(300, lambda: _start_isolated_light_lan(root))
+    except Exception:
+        pass
     try:
         build_ui(db_holder[0], root, session, path_holder, key_path_holder)
     except Exception:
