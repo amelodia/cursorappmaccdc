@@ -839,7 +839,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                             .font(.title3.weight(.bold))
                             .multilineTextAlignment(.center)
                         Text(savesOverLan
-                             ? "Invio al Mac.\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo."
+                             ? "Invio al Desktop.\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo."
                              : "Salvataggio in corso sul file light (Dropbox).\nAttendi la conferma a video.\nNon chiudere Conti Light e non bloccare lo schermo.")
                             .font(.subheadline)
                             .multilineTextAlignment(.center)
@@ -1038,7 +1038,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
         if girataSelected, !a2.isEmpty, a2 != "—" { lines[0] += ", \(a2)" }
         lines.append("Importo (JSON): \(amt) EUR")
         if savesOverLan {
-            lines.append("La registrazione viene inviata al Mac e resta sul telefono finché il Mac non conferma.")
+            lines.append("La registrazione viene inviata al Desktop e resta sul cellulare finché il Desktop non conferma.")
         } else {
             lines.append(
                 "La registrazione resta in questa sessione. Il file light su Dropbox si aggiorna una sola volta quando esci dall’app. Il completo si aggiorna sul desktop."
@@ -1141,7 +1141,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     _ = try ContiDatabase.appendLightSessionRecord(db: &working, recordTemplate: tpl)
                 }
                 ContiDatabase.recomputeLightSaldiFromFullDb(&working)
-                let note = "Registrazione inviata al Mac. Resta sul telefono finché il Mac non conferma il salvataggio."
+                let note = "Registrazione inviata al Desktop. Resta sul cellulare finché il Desktop non conferma il salvataggio."
                 return .success((working, note))
             } catch {
                 return .failure(error)
@@ -1170,7 +1170,7 @@ struct ContiLightNuovoMovimentoSchedaView: View {
                     var working = try ContiDatabase.deepCopyDb(db)
                     try ContiDatabase.setSessionRecordCancelled(db: &working, legacyKey: lk, isCancelled: true)
                     ContiDatabase.recomputeLightSaldiFromFullDb(&working)
-                    let note = "Annullamento inviato al Mac. Resta sul telefono finché il Mac non conferma."
+                    let note = "Annullamento inviato al Desktop. Resta sul cellulare finché il Desktop non conferma."
                     return .success((working, note))
                 } catch {
                     return .failure(error)

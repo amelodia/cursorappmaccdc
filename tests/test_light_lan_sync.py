@@ -251,6 +251,18 @@ class LightMdnsAnnouncementTests(unittest.TestCase):
             self.assertEqual(light_lan_sync.lan_service_name(folder), "Conti prova")
 
 
+class LightPhoneWaitingFlagTests(unittest.TestCase):
+    def test_flag_sits_in_the_dropbox_data_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            folder = Path(td)
+            path = light_lan_sync.phone_waiting_flag_path(folder)
+            self.assertEqual(path, folder / "conti_light_da_inviare.flag")
+            path.write_text("1\n", encoding="utf-8")
+            self.assertTrue(light_lan_sync.phone_waiting_flag_present(folder))
+            light_lan_sync.clear_phone_waiting_flag(folder)
+            self.assertFalse(light_lan_sync.phone_waiting_flag_present(folder))
+
+
 class LightExchangeNoticeTests(unittest.TestCase):
     def test_notice_names_direction_and_count(self) -> None:
         self.assertEqual(
@@ -259,11 +271,11 @@ class LightExchangeNoticeTests(unittest.TestCase):
         )
         self.assertEqual(
             light_lan_sync.exchange_notice(to_phone=1),
-            "Scambio riuscito. 1 registrazione aggiunta o modificata da MAC a IPHONE.",
+            "Scambio riuscito. 1 registrazione aggiunta o modificata da Desktop a Cellulare.",
         )
         self.assertEqual(
             light_lan_sync.exchange_notice(to_mac=2),
-            "Scambio riuscito. 2 registrazioni aggiunte o modificate da IPHONE a MAC.",
+            "Scambio riuscito. 2 registrazioni aggiunte o modificate da Cellulare a Desktop.",
         )
 
     def test_phone_reports_the_same_sentence(self) -> None:
@@ -292,7 +304,7 @@ class LightExchangeNoticeTests(unittest.TestCase):
             finally:
                 server.stop()
         self.assertIn(
-            "Scambio riuscito. 3 registrazioni aggiunte o modificate da MAC a IPHONE.",
+            "Scambio riuscito. 3 registrazioni aggiunte o modificate da Desktop a Cellulare.",
             seen,
         )
 

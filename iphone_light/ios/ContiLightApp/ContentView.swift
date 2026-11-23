@@ -47,6 +47,26 @@ private enum ContiLightFolderBookmark {
     }
 }
 
+/// Segnaposto su Dropbox: il cellulare ha dati e il desktop non era raggiungibile. Nessuna registrazione dentro.
+private enum ContiLightDesktopWaitingFlag {
+    static let fileName = "conti_light_da_inviare.flag"
+
+    static func write(in folder: URL?) {
+        guard let folder, ContiDatabase.folderLooksLikeDesktopDataFolder(folder) else { return }
+        let access = folder.startAccessingSecurityScopedResource()
+        defer { if access { folder.stopAccessingSecurityScopedResource() } }
+        let url = folder.appendingPathComponent(fileName)
+        try? Data("1\n".utf8).write(to: url, options: [])
+    }
+
+    static func remove(in folder: URL?) {
+        guard let folder else { return }
+        let access = folder.startAccessingSecurityScopedResource()
+        defer { if access { folder.stopAccessingSecurityScopedResource() } }
+        try? FileManager.default.removeItem(at: folder.appendingPathComponent(fileName))
+    }
+}
+
 // MARK: - Ultima email (prefill schermata accesso)
 
 private enum ContiLightLastLoginEmail {
@@ -301,9 +321,9 @@ struct ContentView: View {
         let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty { return message }
         if !lanTokenKnown {
-            return "Al primo collegamento inserisci email, password e il codice di 6 cifre mostrato da Conti di casa sul Mac, acceso sulla stessa rete Wi-Fi."
+            return "Al primo collegamento inserisci email, password e il codice di 6 cifre mostrato da Conti di casa sul Desktop, acceso sulla stessa rete Wi-Fi."
         }
-        return "Inserisci email e password. Conti Light si collega al Mac acceso sulla stessa rete Wi-Fi."
+        return "Inserisci email e password. Conti Light si collega al Desktop acceso sulla stessa rete Wi-Fi."
     }
 
     private var loginForm: some View {
@@ -821,7 +841,7 @@ struct ContentView: View {
                     }
                 }
                 .disabled(isRefreshingSession || isBusy)
-                .accessibilityLabel("Aggiorna dal Mac")
+                .accessibilityLabel("Aggiorna dal Desktop")
             }
         }
         .sheet(isPresented: $showFiltriSheet) {
@@ -991,29 +1011,30 @@ struct ContentView: View {
                 return
             }
             isBusy = true
-            message = "Primo collegamento: cerco il Mac…"
+            message = "Primo collegamento: cerco il Desktop…"
             defer { isBusy = false }
             do {
                 let light = try await lanClient.pairAndPull(code: code)
                 guard ContiDatabase.tryLogin(db: light, email: emailTrim, password: passwordTrim) != nil else {
-                    message = "Password non riconosciuta sul Mac."
+                    message = "Password non riconosciuta sul Desktop."
                     return
                 }
                 await adoptMacLight(light, emailTrim: emailTrim, fresh: true)
             } catch {
                 let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                message = "Per la prima apertura il Mac deve essere acceso. \(detail)"
+                message = "Per la prima apertura il Desktop deve essere acceso. \(detail)"
+                leaveDesktopWaitingFlagIfNeeded()
             }
         }
     }
 
     /// Dopo l'apertura, allinea l'elenco con il Mac senza tenere ferma la schermata di accesso.
     private func syncProvaAfterOpen(code: String, emailTrim: String, passwordTrim: String) async {
-        message = "Sincronizzo con il Mac…"
+        message = "Sincronizzo con il Desktop…"
         do {
             let light = try await lanClient.pairAndPull(code: code)
             guard ContiDatabase.tryLogin(db: light, email: emailTrim, password: passwordTrim) != nil else {
-                message = "Password non riconosciuta sul Mac."
+                message = "Password non riconosciuta sul Desktop."
                 return
             }
             await adoptMacLight(light, emailTrim: emailTrim, fresh: false)
@@ -1023,6 +1044,7 @@ struct ContentView: View {
                     await flushLanIfDirty()
                 }
                 message = macClosedSyncMessage
+                leaveDesktopWaitingFlagIfNeeded()
                 if !lanMacClosedNoticeShown {
                     lanMacClosedNoticeShown = true
                     lanNoticeText = macClosedSyncMessage
@@ -1030,8 +1052,9 @@ struct ContentView: View {
                 }
                 return
             }
-            message = "Mac spento. L'elenco resta quello del telefono."
-            lanNoticeText = "Mac spento. Le registrazioni nuove restano sul telefono e si inviano quando il Mac è acceso."
+            message = "Desktop spento. L'elenco resta quello del cellulare."
+            lanNoticeText = "Desktop spento. Le registrazioni nuove restano sul cellulare e si inviano quando il Desktop è acceso."
+            leaveDesktopWaitingFlagIfNeeded()
             lanNoticePresented = true
         }
     }
@@ -1079,10 +1102,12 @@ struct ContentView: View {
             to: ContiLanClient.fingerprints(of: light)
         )
         if stillUnsent {
-            message = "Registrazioni ancora solo sul telefono. Si inviano quando il Mac risponde."
-            lanNoticeText = "Le registrazioni immesse col Mac spento sono ancora sul telefono."
+            message = "Registrazioni ancora solo sul cellulare. Si inviano quando il Desktop risponde."
+            lanNoticeText = "Le registrazioni immesse col Desktop spento sono ancora sul cellulare."
+            leaveDesktopWaitingFlagIfNeeded()
         } else {
-            message = "Collegato al Mac."
+            message = "Collegato al Desktop."
+            clearDesktopWaitingFlag()
             lanNoticeText = ContiLanClient.exchangeNotice(toPhone: fromMac, toMac: sentCount)
             await lanClient.reportExchange(toPhone: fromMac, toMac: sentCount)
         }
@@ -1121,7 +1146,7 @@ struct ContentView: View {
         lanFingerprints = ContiLanClient.fingerprints(of: last ?? [:])
         loggedInRecords = ContiDatabase.displayRecords(from: session, sort: movimentiListSort)
         movimentiDisplayName = ContiDatabase.displayNameForHeader(db: session, email: emailTrim)
-        message = "Elenco del telefono."
+        message = "Elenco del cellulare."
         lanNoticePresented = false
         lanTokenKnown = await lanClient.hasSavedToken()
         return true
@@ -1233,7 +1258,8 @@ struct ContentView: View {
             rememberLanSnapshot(light)
         } catch {
             if !quiet {
-                message = "Mac non raggiungibile. Le registrazioni restano sul telefono."
+                message = "Desktop non raggiungibile. Le registrazioni restano sul cellulare."
+                leaveDesktopWaitingFlagIfNeeded()
             }
         }
     }
@@ -1248,6 +1274,7 @@ struct ContentView: View {
             if ContiDatabase.lanUnsentGenerationNow() == generation {
                 lightDropboxDirty = false
                 lanFingerprints = ContiLanClient.fingerprints(of: db)
+                clearDesktopWaitingFlag()
             }
             return
         }
@@ -1261,13 +1288,15 @@ struct ContentView: View {
                 lightDropboxDirty = false
                 rememberLanSnapshot(light)
             }
-            message = "Salvate sul Mac."
+            message = "Salvate sul Desktop."
+            clearDesktopWaitingFlag()
             lanNoticeText = ContiLanClient.exchangeNotice(toPhone: 0, toMac: dirty.count)
             lanNoticePresented = true
             lanMacClosedNoticeShown = false
         } catch {
             if isMacAppClosed(error) {
                 message = macClosedSyncMessage
+                leaveDesktopWaitingFlagIfNeeded()
                 if !lanMacClosedNoticeShown {
                     lanMacClosedNoticeShown = true
                     lanNoticeText = macClosedSyncMessage
@@ -1276,17 +1305,30 @@ struct ContentView: View {
                 return
             }
             let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            message = "Registrazioni ancora solo sul telefono. \(detail)"
+            message = "Registrazioni ancora solo sul cellulare. \(detail)"
+            leaveDesktopWaitingFlagIfNeeded()
         }
     }
 
     private var macClosedSyncMessage: String {
-        "Il Mac è chiuso. Le registrazioni restano sul telefono. Alla riapertura, se Light è chiusa, il Mac avvisa di riaprirla."
+        "Il Desktop è chiuso. Le registrazioni restano sul cellulare. Alla riapertura, se Conti Light è chiusa, il Desktop avvisa di avviarla."
     }
 
     private func isMacAppClosed(_ error: Error) -> Bool {
         let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         return detail.contains("app_chiusa")
+    }
+
+    private func leaveDesktopWaitingFlagIfNeeded() {
+        guard lightDropboxDirty else {
+            clearDesktopWaitingFlag()
+            return
+        }
+        ContiLightDesktopWaitingFlag.write(in: dataFolderURL)
+    }
+
+    private func clearDesktopWaitingFlag() {
+        ContiLightDesktopWaitingFlag.remove(in: dataFolderURL)
     }
 
     private func refreshLightSessionIfLoggedIn(forceReResolveEnc: Bool = true, forceCloudRedownload: Bool = false) async {
@@ -1590,7 +1632,7 @@ struct ContentView: View {
                    ContiDatabase.lightFileCandidates(inFolder: folderURL, email: emailTrim).isEmpty {
                     packet = LoginResultPacket(
                         message: """
-                        Non riesco a scaricare il file light aggiornato da Dropbox (la copia sul telefono era probabilmente quella dell’ultima apertura). \
+                        Non riesco a scaricare il file light aggiornato da Dropbox (la copia sul cellulare era probabilmente quella dell’ultima apertura). \
                         Apri l’app Dropbox, attendi che \(encRef.lastPathComponent) sia in linea, poi in Conti Light tocca «Allinea file con Dropbox» e Accedi. \
                         Se Dropbox è già aggiornato, usa «Cambia cartella…» e riseleziona la stessa cartella.
                         """,
@@ -1670,7 +1712,7 @@ struct ContentView: View {
                                             ? "La registrazione inserita in questa app è stata scritta nel file light della cartella dati."
                                             : "Le \(recovered) registrazioni inserite in questa app sono state scritte nel file light della cartella dati."
                                     } catch {
-                                        pendingFlushNote = "Le registrazioni inserite in questa app restano sul telefono e non sono ancora nel file Dropbox. \(error.localizedDescription)"
+                                        pendingFlushNote = "Le registrazioni inserite in questa app restano sul cellulare e non sono ancora nel file Dropbox. \(error.localizedDescription)"
                                     }
                                 } else {
                                     ContiDatabase.quarantineStalePendingLightSession()

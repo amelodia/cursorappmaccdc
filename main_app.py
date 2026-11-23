@@ -37467,6 +37467,7 @@ def _start_isolated_light_lan(root: tk.Tk) -> None:
                 text.startswith("Collegamento riuscito")
                 or text.startswith("Scambio riuscito")
                 or text.startswith("Da sincronizzare")
+                or text.startswith("La app del cellulare")
             ):
                 _show_small_notice(text)
 
@@ -37486,13 +37487,19 @@ def _start_isolated_light_lan(root: tk.Tk) -> None:
     atexit.register(server.stop)
 
     def _warn_if_phone_waiting() -> None:
-        count = light_lan_sync.read_light_pending_count(data_workspace.data_dir())
-        if count <= 0:
-            return
-        on_status(
-            "Da sincronizzare: sull'iPhone ci sono registrazioni non ancora arrivate. "
-            "Conti Light è chiuso: riaprilo per sincronizzarle."
+        data_dir = data_workspace.data_dir()
+        waiting = light_lan_sync.phone_waiting_flag_present(data_dir) or (
+            light_lan_sync.read_light_pending_count(data_dir) > 0
         )
+        if server.phone_seen():
+            light_lan_sync.clear_phone_waiting_flag(data_dir)
+            light_lan_sync.clear_light_pending(data_dir)
+            return
+        if not waiting:
+            return
+        light_lan_sync.clear_phone_waiting_flag(data_dir)
+        light_lan_sync.clear_light_pending(data_dir)
+        on_status("La app del cellulare ha dati da inviare. Per favore avviala.")
 
     try:
         root.after(12000, _warn_if_phone_waiting)

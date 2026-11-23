@@ -64,7 +64,7 @@ actor ContiLanClient {
         }
         let reply = try await roundTrip(message)
         guard (reply["op"] as? String) == "pull_ok", let light = reply["light"] as? [String: Any] else {
-            throw ContiLanError.message(Self.errorText(reply) ?? "Il Mac non ha inviato i dati.")
+            throw ContiLanError.message(Self.errorText(reply) ?? "Il Desktop non ha inviato i dati.")
         }
         rememberRevision(reply)
         return light
@@ -102,10 +102,10 @@ actor ContiLanClient {
     static func exchangeNotice(toPhone: Int, toMac: Int) -> String {
         var parts: [String] = []
         if toPhone > 0 {
-            parts.append(exchangePhrase(toPhone, direction: "MAC a IPHONE"))
+            parts.append(exchangePhrase(toPhone, direction: "Desktop a Cellulare"))
         }
         if toMac > 0 {
-            parts.append(exchangePhrase(toMac, direction: "IPHONE a MAC"))
+            parts.append(exchangePhrase(toMac, direction: "Cellulare a Desktop"))
         }
         if parts.isEmpty {
             return "Scambio riuscito. Nessuna modifica."
@@ -120,7 +120,7 @@ actor ContiLanClient {
         return "\(count) registrazioni aggiunte o modificate da \(direction)."
     }
 
-    /// Il Mac è aperto e non c'è più nulla da inviare: toglie l'avviso lasciato a programma chiuso.
+    /// Il Desktop è aperto e non c'è più nulla da inviare: toglie l'avviso lasciato a programma chiuso.
     func clearPendingNotice() async -> Bool {
         do {
             try await ensureConnection(code: "", force: false)
@@ -136,7 +136,7 @@ actor ContiLanClient {
         try await ensureConnection(code: "", force: false)
         let reply = try await roundTrip(["op": "revision"])
         guard (reply["op"] as? String) == "revision_ok" else {
-            throw ContiLanError.message(Self.errorText(reply) ?? "Il Mac non risponde.")
+            throw ContiLanError.message(Self.errorText(reply) ?? "Il Desktop non risponde.")
         }
         return Self.intValue(reply["revision"])
     }
@@ -145,7 +145,7 @@ actor ContiLanClient {
         try await ensureConnection(code: "", force: false)
         let reply = try await roundTrip(["op": "push", "records": records])
         guard (reply["op"] as? String) == "push_ok", let light = reply["light"] as? [String: Any] else {
-            throw ContiLanError.message(Self.errorText(reply) ?? "Il Mac non ha confermato il salvataggio.")
+            throw ContiLanError.message(Self.errorText(reply) ?? "Il Desktop non ha confermato il salvataggio.")
         }
         rememberRevision(reply)
         return light
@@ -311,7 +311,7 @@ actor ContiLanClient {
             storeKey(received)
         }
         guard !keyText.isEmpty else {
-            throw ContiLanError.message("Il Mac non ha consegnato la chiave.")
+            throw ContiLanError.message("Il Desktop non ha consegnato la chiave.")
         }
     }
 
@@ -404,7 +404,7 @@ actor ContiLanClient {
             browser.start(queue: queue)
             queue.asyncAfter(deadline: .now() + 8) {
                 finish(.failure(ContiLanError.message(
-                    "Conti di casa non è in ascolto. Apri l'app sul Mac, sulla stessa rete Wi-Fi. Al primo collegamento inserisci il codice."
+                    "Conti di casa non è in ascolto. Apri l'app sul Desktop, sulla stessa rete Wi-Fi. Al primo collegamento inserisci il codice."
                 )))
             }
         }
@@ -438,7 +438,7 @@ actor ContiLanClient {
             }
             conn.start(queue: queue)
             queue.asyncAfter(deadline: .now() + 8) {
-                finish(.failure(ContiLanError.message("Il Mac non risponde.")))
+                finish(.failure(ContiLanError.message("Il Desktop non risponde.")))
             }
         }
     }
@@ -473,11 +473,11 @@ actor ContiLanClient {
             let bytes = [UInt8](header)
             let size = (Int(bytes[0]) << 24) | (Int(bytes[1]) << 16) | (Int(bytes[2]) << 8) | Int(bytes[3])
             guard size > 0, size <= 16 * 1024 * 1024 else {
-                throw ContiLanError.message("Risposta del Mac troppo grande.")
+                throw ContiLanError.message("Risposta del Desktop troppo grande.")
             }
             let payload = try await receive(size)
             guard var reply = try jsonObject(payload) else {
-                throw ContiLanError.message("Risposta del Mac illeggibile.")
+                throw ContiLanError.message("Risposta del Desktop illeggibile.")
             }
             if (reply["op"] as? String) == "sealed" {
                 guard let decryptor = FernetDecryptor(keyFileContents: keyText) else {
@@ -486,7 +486,7 @@ actor ContiLanClient {
                 let token = reply["payload"] as? String ?? ""
                 let clear = try decryptor.decrypt(encFileContents: Data(token.utf8))
                 guard let opened = try jsonObject(clear) else {
-                    throw ContiLanError.message("Risposta del Mac illeggibile.")
+                    throw ContiLanError.message("Risposta del Desktop illeggibile.")
                 }
                 reply = opened
             }
@@ -509,7 +509,7 @@ actor ContiLanClient {
 
     private func send(_ data: Data) async throws {
         guard let connection else {
-            throw ContiLanError.message("Nessun collegamento con il Mac.")
+            throw ContiLanError.message("Nessun collegamento con il Desktop.")
         }
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             connection.send(content: data, completion: .contentProcessed { error in
@@ -524,7 +524,7 @@ actor ContiLanClient {
 
     private func receive(_ count: Int) async throws -> Data {
         guard let connection else {
-            throw ContiLanError.message("Nessun collegamento con il Mac.")
+            throw ContiLanError.message("Nessun collegamento con il Desktop.")
         }
         var got = Data()
         while got.count < count {
@@ -539,14 +539,14 @@ actor ContiLanClient {
                         return
                     }
                     if isComplete {
-                        cont.resume(throwing: ContiLanError.message("Il Mac ha chiuso il collegamento."))
+                        cont.resume(throwing: ContiLanError.message("Il Desktop ha chiuso il collegamento."))
                         return
                     }
                     cont.resume(returning: Data())
                 }
             }
             if chunk.isEmpty {
-                throw ContiLanError.message("Il Mac ha chiuso il collegamento.")
+                throw ContiLanError.message("Il Desktop ha chiuso il collegamento.")
             }
             got.append(chunk)
         }

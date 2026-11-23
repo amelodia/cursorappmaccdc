@@ -31,6 +31,7 @@ _MDNS_PORT = 5353
 MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 PEER_FILE_NAME = "lan_prova_peer.json"
 PENDING_FILE_NAME = "lan_light_pending.json"
+PHONE_WAITING_FLAG = "conti_light_da_inviare.flag"
 GUI_LOCK_NAME = "lan_gui_ascolto.txt"
 PID_FILE_NAME = "lan_avviso_light.pid"
 _data_revision = 0
@@ -236,9 +237,9 @@ def exchange_notice(*, to_phone: int = 0, to_mac: int = 0) -> str:
     """Testo dell'avviso di scambio: nessuna modifica, oppure il verso e il numero."""
     parts: list[str] = []
     if to_phone > 0:
-        parts.append(_exchange_phrase(to_phone, "MAC a IPHONE"))
+        parts.append(_exchange_phrase(to_phone, "Desktop a Cellulare"))
     if to_mac > 0:
-        parts.append(_exchange_phrase(to_mac, "IPHONE a MAC"))
+        parts.append(_exchange_phrase(to_mac, "Cellulare a Desktop"))
     if not parts:
         return "Scambio riuscito. Nessuna modifica."
     return "Scambio riuscito. " + " ".join(parts)
@@ -349,6 +350,7 @@ class LightLanServer:
         self._thread: threading.Thread | None = None
         self._advertiser: subprocess.Popen | None = None
         self._mdns: _WindowsMdnsAnnouncer | None = None
+        self._phone_seen = False
         self._stop = threading.Event()
         self.port = 0
 
@@ -358,6 +360,10 @@ class LightLanServer:
     def has_paired_phone(self) -> bool:
         """Vero dopo il primo accoppiamento: il telefono rientra col token, senza il codice."""
         return bool(self._token)
+
+    def phone_seen(self) -> bool:
+        """Vero se il cellulare si è collegato da quando questo ascolto è partito."""
+        return self._phone_seen
 
     def start(self) -> int:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -475,6 +481,8 @@ class LightLanServer:
                     msg = open_sealed(msg, key)
                 op = str(msg.get("op") or "")
                 reply, paired = self._dispatch(msg, op, paired)
+                if paired or reply.get("op") == "pair_ok":
+                    self._phone_seen = True
                 failed_unpaired = reply.get("op") == "error" and not paired
                 if paired and reply.get("op") != "pair_ok" and key:
                     reply = seal(reply, key)
@@ -518,7 +526,7 @@ class LightLanServer:
         if op == "pull":
             quiet = bool(msg.get("quiet"))
             if not quiet:
-                self.on_status("Scambio in corso: preparo l'elenco per il telefono.")
+                self.on_status("Scambio in corso: preparo l'elenco per il cellulare.")
             light = self.snapshot()
             revision = current_data_revision()
             if isinstance(light, dict):
@@ -646,6 +654,22 @@ def write_light_pending(data_dir: Path, count: int) -> None:
 def clear_light_pending(data_dir: Path) -> None:
     try:
         (lan_state_dir(data_dir) / PENDING_FILE_NAME).unlink()
+    except OSError:
+        pass
+
+
+def phone_waiting_flag_path(data_dir: Path) -> Path:
+    """Segnaposto su Dropbox: il cellulare ha dati e il desktop non era raggiungibile."""
+    return Path(data_dir) / PHONE_WAITING_FLAG
+
+
+def phone_waiting_flag_present(data_dir: Path) -> bool:
+    return phone_waiting_flag_path(data_dir).is_file()
+
+
+def clear_phone_waiting_flag(data_dir: Path) -> None:
+    try:
+        phone_waiting_flag_path(data_dir).unlink()
     except OSError:
         pass
 
